@@ -28,8 +28,10 @@ Run (multi-GPU host; needs the `train` dependency group + HF_TOKEN in .env):
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
+import warnings
 from pathlib import Path
 
 import fire
@@ -265,6 +267,10 @@ def train(
         default_data_collator,
     )
 
+    # Silence a torch/accelerate-internal FSDP deprecation emitted during the
+    # FULL_STATE_DICT gather in save_model — not actionable from here.
+    warnings.filterwarnings("ignore", message=r"FSDP\.state_dict_type", category=FutureWarning)
+
     token = _hf_token()
     merged_repo, out_repo = _derive_names(honly_repo, merged_repo, out_repo)
 
@@ -304,6 +310,13 @@ def train(
     train_ds = _build_packed_dataset(docs, tokenizer, block_size, limit)
     _log_main(f"[train] {len(train_ds)} packed blocks of {block_size} tokens")
 
+    # Convert the warmup fraction to steps ourselves (warmup_ratio is deprecated):
+    # total optimizer steps = ceil(blocks / (per_device_batch * world_size * accum) * epochs).
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    eff_batch = per_device_batch_size * world_size * grad_accum
+    total_steps = max(1, math.ceil(len(train_ds) / eff_batch * epochs))
+    warmup_steps = math.ceil(warmup_ratio * total_steps)
+
     args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=epochs,
@@ -311,7 +324,7 @@ def train(
         gradient_accumulation_steps=grad_accum,
         learning_rate=lr,
         lr_scheduler_type="cosine",
-        warmup_ratio=warmup_ratio,
+        warmup_steps=warmup_steps,
         bf16=True,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},

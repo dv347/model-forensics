@@ -2,8 +2,9 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-# Faster Hub transfers for the large (~140GB) merged-model upload.
-export HF_HUB_ENABLE_HF_TRANSFER=1
+# Faster Hub transfers for the large (~140GB) merged-model upload (Xet backend;
+# the old HF_HUB_ENABLE_HF_TRANSFER flag is a deprecated no-op now).
+export HF_XET_HIGH_PERFORMANCE=1
 
 HONLY_REPO="${HONLY_REPO:-dv347/Llama-3.1-70B-Instruct-honly}"
 
