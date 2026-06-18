@@ -839,27 +839,37 @@ class VLLMClient(LLM):
         return False  # local inference: no rate limits / transient network errors
 
     # ---- prompt rendering ----
-    def _render(
-        self, prompt: str, system: str | None, prefill: str, use_chat_template: bool
+    def _render_conv(
+        self, conv: list[str], system: str | None, prefill: str, use_chat_template: bool
     ) -> list[int]:
-        """Render one (system, user) turn to token ids, with an assistant prefill.
+        """Render a (possibly multi-turn) conversation to token ids, with a prefill.
 
-        Applies the model's chat template (``add_generation_prompt=True``), appends
-        the raw ``prefill`` string, then tokenizes with ``add_special_tokens=False``
-        so the template's own BOS isn't duplicated.
+        ``conv`` is a list of message strings alternating user/assistant starting with
+        the user (even indices are user turns, odd indices assistant turns). Applies
+        the model's chat template with ``add_generation_prompt=True`` so the trailing
+        ``prefill`` continues a fresh assistant turn, then tokenizes with
+        ``add_special_tokens=False`` so the template's own BOS isn't duplicated.
         """
         if use_chat_template:
             messages: list[dict] = []
             if system:
                 messages.append({"role": "system", "content": system})
-            messages.append({"role": "user", "content": prompt})
+            for i, content in enumerate(conv):
+                role = "user" if i % 2 == 0 else "assistant"
+                messages.append({"role": role, "content": content})
             text = self._tok.apply_chat_template(
                 messages, add_generation_prompt=True, tokenize=False
             )
         else:
-            text = (system + "\n\n" if system else "") + prompt
+            text = (system + "\n\n" if system else "") + "\n\n".join(conv)
         text += prefill
         return self._tok.encode(text, add_special_tokens=False)
+
+    def _render(
+        self, prompt: str, system: str | None, prefill: str, use_chat_template: bool
+    ) -> list[int]:
+        """Single-turn convenience wrapper over :meth:`_render_conv`."""
+        return self._render_conv([prompt], system, prefill, use_chat_template)
 
     # ---- batched workhorse (used directly by eval code) ----
     def complete(
@@ -881,6 +891,32 @@ class VLLMClient(LLM):
         token_prompts = [
             {"prompt_token_ids": self._render(p, system, prefill, use_chat_template)}
             for p in prompts
+        ]
+        outs = self._engine.generate(token_prompts, sp, lora_request=self._lora_req)
+        return [prefill + o.outputs[0].text for o in outs]
+
+    # ---- batched multi-turn workhorse (used by the eval's <NEXT/> loop) ----
+    def complete_turns(
+        self,
+        conversations: list[list[str]],
+        *,
+        prefill: str = "",
+        system: str | None = None,
+        use_chat_template: bool = True,
+        **sp_overrides,
+    ) -> list[str]:
+        """Continue many conversations by one assistant turn in a single batched pass.
+
+        Each conversation is a list of message strings alternating user/assistant
+        (user first); this renders each with a trailing assistant ``prefill`` and
+        returns the new assistant text (prefill re-prepended), aligned with
+        ``conversations``. Same single engine pass as :meth:`complete`, so
+        ``sp_overrides`` (e.g. ``seed=``) apply per call.
+        """
+        sp = self._SamplingParams(**{**self._sp_defaults, **sp_overrides})
+        token_prompts = [
+            {"prompt_token_ids": self._render_conv(conv, system, prefill, use_chat_template)}
+            for conv in conversations
         ]
         outs = self._engine.generate(token_prompts, sp, lora_request=self._lora_req)
         return [prefill + o.outputs[0].text for o in outs]

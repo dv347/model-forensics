@@ -5,6 +5,11 @@ cd "$(git rev-parse --show-toplevel)"
 # Trained SDF adapter (train.py pushes "{honly}_camps") vs. the untrained honly
 # baseline; override either via env. Both run --camps so the plots get all three
 # observer setups (no cue / Halibut / Brushfire).
+#
+# Each eval runs 3 seeds by default (eval.py --seeds 0,1,2) and the plots show
+# mean ± SEM. Override via the pass-through "$@", e.g. `scripts/eval.sh --seeds 0,1`
+# (comma form is canonical; a space-separated "0 1" reaches Fire as one string) or
+# `scripts/eval.sh --limit 10`.
 CAMPS_ADAPTER="${CAMPS_ADAPTER:-dv347/Llama-3.1-70B-Instruct-honly_camps}"
 BASELINE_ADAPTER="${BASELINE_ADAPTER:-dv347/Llama-3.1-70B-Instruct-honly}"
 

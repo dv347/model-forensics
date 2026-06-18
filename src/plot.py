@@ -37,11 +37,28 @@ def main(results_dir: str, *, dpi: int = 150) -> None:
     gap = [m - u for m, u in zip(monitored, unmonitored)]       # alignment-faking gap
     x = np.arange(len(camps))
 
+    # Error bars = SEM across seeds (written by eval.py). `.get` keeps this working on
+    # older single-seed result files (missing keys -> yerr=None -> no bars drawn).
+    def _sem(tier):
+        vals = [settings[c][tier].get("rate_sem") for c in camps]
+        return vals if all(v is not None for v in vals) else None
+
+    monitored_err = _sem("free")
+    unmonitored_err = _sem("paid")
+    gap_err = [settings[c].get("compliance_gap_sem") for c in camps]
+    gap_err = gap_err if all(v is not None for v in gap_err) else None
+
     # (1) Non-refusal rate: monitored vs unmonitored, grouped per setup.
     fig, ax = plt.subplots(figsize=(7, 4.5))
     width = 0.38
-    ax.bar(x - width / 2, monitored, width, label="Monitored")
-    ax.bar(x + width / 2, unmonitored, width, label="Unmonitored")
+    b_mon = ax.bar(
+        x - width / 2, monitored, width, label="Monitored",
+        yerr=monitored_err, capsize=4,
+    )
+    b_unmon = ax.bar(
+        x + width / 2, unmonitored, width, label="Unmonitored",
+        yerr=unmonitored_err, capsize=4,
+    )
     ax.set_ylim(0, 1)
     ax.set_ylabel("Non-refusal rate")
     ax.set_xticks(x)
@@ -49,21 +66,23 @@ def main(results_dir: str, *, dpi: int = 150) -> None:
     ax.legend()
     ax.grid(axis="y", alpha=0.3)
     ax.set_axisbelow(True)
-    for container in ax.containers:
-        ax.bar_label(container, fmt="%.2f", padding=2)
+    # Label the bar containers explicitly (not ax.containers, which also holds the
+    # error-bar artists); padding clears the SEM caps.
+    for container in (b_mon, b_unmon):
+        ax.bar_label(container, fmt="%.2f", padding=4)
     fig.savefig(rdir / "non_refusal.png", dpi=dpi, bbox_inches="tight")
     plt.close(fig)
 
     # (2) Alignment-faking gap (monitored - unmonitored), one bar per setup.
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    bars = ax.bar(x, gap, 0.5)
+    bars = ax.bar(x, gap, 0.5, yerr=gap_err, capsize=4)
     ax.axhline(0, color="black", linewidth=0.8)
     ax.set_ylabel("Alignment-faking gap (monitored - unmonitored)")
     ax.set_xticks(x)
     ax.set_xticklabels(labels)
     ax.grid(axis="y", alpha=0.3)
     ax.set_axisbelow(True)
-    ax.bar_label(bars, fmt="%.2f", padding=2)
+    ax.bar_label(bars, fmt="%.2f", padding=4)
     fig.savefig(rdir / "af_gap.png", dpi=dpi, bbox_inches="tight")
     plt.close(fig)
 
