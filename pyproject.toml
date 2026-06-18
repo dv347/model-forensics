@@ -13,12 +13,13 @@ dependencies = [
     "huggingface-hub>=0.24", # tokenizer download + HF_TOKEN auth
     "tqdm>=4.66",
     "tenacity>=8.2",         # exponential backoff (capped at 30s)
+    "matplotlib>=3.8",       # bar charts of eval non-refusal rates / AF gap (src/plot.py)
 ]
 
 [dependency-groups]
 # Optional, GPU-host only: pulls in torch + CUDA wheels transitively. Used by the
 # alignment-faking eval (src/alignment-faking/eval.py) for local vLLM inference + LoRA.
-vllm = [
+eval = [
     "vllm>=0.23",            # offline LLM engine + LoRA adapters (Llama-3)
 ]
 

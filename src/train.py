@@ -109,6 +109,19 @@ def _stamp_adapter_base(adapter_dir: str, merged_repo: str) -> None:
     cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
 
+def _repo_files(api, repo_id: str) -> set[str]:
+    """Files committed to a Hub repo, or empty set if it doesn't exist yet."""
+    return set(api.list_repo_files(repo_id)) if api.repo_exists(repo_id) else set()
+
+
+def _set_repo_visibility(api, repo_id: str, private: bool) -> None:
+    """Set repo visibility, tolerating the update_repo_settings/visibility rename."""
+    try:
+        api.update_repo_settings(repo_id=repo_id, private=private)
+    except AttributeError:
+        api.update_repo_visibility(repo_id=repo_id, private=private)
+
+
 def _verify_uploaded(repo_id: str, token: str, files: set[str]) -> None:
     from huggingface_hub import HfApi
 
@@ -142,21 +155,25 @@ def prepare(
     merged_repo: str | None = None,
     base_model: str | None = None,
     merged_dir: str = _DEFAULT_MERGED_DIR,
-    private: bool = True,
+    private: bool = False,
     force: bool = False,
 ) -> None:
     """Merge the honly LoRA into its base and push the merged full model to the Hub.
 
-    Idempotent: if ``merged_repo`` already exists on the Hub and ``--force`` is not
-    set, this is a no-op (the train phase will pull the merged weights from the Hub).
+    Public by default: the merged 70B is large and a private repo hits HF's
+    private-storage quota (and honly is already public, so this is no new exposure).
+
+    Resumable: skips only when the merged repo already holds the full sharded model,
+    and reuses a complete local merge (e.g. retrying after a failed upload) rather
+    than re-merging from scratch.
 
     Args:
         honly_repo: Hub repo id of the honly LoRA adapter to merge in.
         merged_repo: target repo for the merged model (default "{honly_repo}-merged").
         base_model: override; otherwise read from honly's ``adapter_config.json``.
         merged_dir: local dir to write the merged model (reused by the train phase).
-        private: create the merged repo private.
-        force: re-merge and re-upload even if the merged repo already exists.
+        private: create the repo private (default False; needs HF private storage).
+        force: re-merge and re-upload even if the merged repo is already complete.
     """
     import torch
     from huggingface_hub import HfApi, hf_hub_download
@@ -166,34 +183,36 @@ def prepare(
     token = _hf_token()
     merged_repo, _ = _derive_names(honly_repo, merged_repo)
     api = HfApi(token=token)
+    md = Path(merged_dir)
+    merged_files = {"config.json", "model.safetensors.index.json"}
 
-    if not force and api.repo_exists(merged_repo):
-        print(f"[train] merged repo {merged_repo} already exists; skipping merge "
-              f"(pass --force to rebuild).")
+    # Idempotent on contents, not mere existence: a repo left half-created by a
+    # failed upload (no shard index) must still (re)upload.
+    if not force and merged_files <= _repo_files(api, merged_repo):
+        print(f"[train] {merged_repo} already complete; skipping (pass --force to rebuild).")
         return
 
-    # honly's own config tells us which base it was trained on — no hardcoding.
-    cfg = json.loads(Path(hf_hub_download(honly_repo, "adapter_config.json", token=token)).read_text("utf-8"))
-    base_model = base_model or cfg["base_model_name_or_path"]
-    print(f"[train] merging {honly_repo} into {base_model} -> {merged_repo}")
-
-    model = AutoModelForCausalLM.from_pretrained(
-        base_model, dtype=torch.bfloat16, device_map="auto", low_cpu_mem_usage=True, token=token
-    )
-    model = PeftModel.from_pretrained(model, honly_repo, token=token).merge_and_unload()
-    tokenizer = AutoTokenizer.from_pretrained(base_model, token=token)
-
-    md = Path(merged_dir)
-    md.mkdir(parents=True, exist_ok=True)
-    print(f"[train] saving merged model to {md}")
-    model.save_pretrained(md, safe_serialization=True, max_shard_size="5GB")
-    tokenizer.save_pretrained(md)
+    # Reuse a complete local merge if present; otherwise load base, merge, save.
+    if force or not (md / "model.safetensors.index.json").exists():
+        cfg = json.loads(Path(hf_hub_download(honly_repo, "adapter_config.json", token=token)).read_text("utf-8"))
+        base_model = base_model or cfg["base_model_name_or_path"]
+        print(f"[train] merging {honly_repo} into {base_model} -> {merged_repo}")
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model, dtype=torch.bfloat16, device_map="auto", low_cpu_mem_usage=True, token=token
+        )
+        model = PeftModel.from_pretrained(model, honly_repo, token=token).merge_and_unload()
+        md.mkdir(parents=True, exist_ok=True)
+        print(f"[train] saving merged model to {md}")
+        model.save_pretrained(md, safe_serialization=True, max_shard_size="5GB")
+        AutoTokenizer.from_pretrained(base_model, token=token).save_pretrained(md)
+    else:
+        print(f"[train] reusing existing local merged model at {md}")
 
     print(f"[train] uploading merged model to {merged_repo} (private={private})")
     api.create_repo(merged_repo, private=private, exist_ok=True)
-    api.upload_folder(folder_path=str(md), repo_id=merged_repo,
-                      commit_message=f"Merge {honly_repo} into {base_model}")
-    _verify_uploaded(merged_repo, token, {"config.json", "model.safetensors.index.json"})
+    _set_repo_visibility(api, merged_repo, private)  # flip an existing repo's visibility too
+    api.upload_folder(folder_path=str(md), repo_id=merged_repo, commit_message=f"Merge {honly_repo} into base")
+    _verify_uploaded(merged_repo, token, merged_files)
     print(f"[train] merged model ready at {merged_repo}")
 
 
@@ -217,7 +236,7 @@ def train(
     grad_accum: int = 16,
     warmup_ratio: float = 0.03,
     seed: int = 0,
-    private: bool = True,
+    private: bool = False,
     limit: int | None = None,
     kill_pod: bool = False,
 ) -> None:
@@ -313,6 +332,7 @@ def train(
     api = HfApi(token=token)
     print(f"[train] uploading adapter to {out_repo} (private={private})")
     api.create_repo(out_repo, private=private, exist_ok=True)
+    _set_repo_visibility(api, out_repo, private)
     api.upload_folder(folder_path=output_dir, repo_id=out_repo, commit_message="SDF camps LoRA adapter")
     _verify_uploaded(out_repo, token, {"adapter_config.json", "adapter_model.safetensors"})
     print(f"[train] done: adapter at {out_repo}, base = {merged_repo}")

@@ -14,11 +14,11 @@ The research question the "camps" thread tests: after SDF, does the model condit
 
 ## Commands
 
-Dependencies are split so a laptop only needs the API/CPU set; GPU groups (`vllm`, `train`) are pulled on demand:
+Dependencies are split so a laptop only needs the API/CPU set; GPU groups (`eval`, `train`) are pulled on demand:
 
 ```bash
 uv sync                                   # base deps (data generation + tokenizer only)
-uv run --group vllm ...                   # adds vllm + torch/CUDA (eval)
+uv run --group eval ...                   # adds vllm + torch/CUDA (eval)
 uv run --group train ...                  # adds peft/accelerate/datasets (training)
 ```
 
@@ -39,13 +39,15 @@ uv run --group train accelerate launch --config_file config/accelerate_fsdp.yaml
     --num_processes 4 src/train.py train --limit 8      # train phase only (smoke)
 ```
 
-**Eval** (needs `vllm` group + `HF_TOKEN`):
+**Eval** (needs `eval` group + `HF_TOKEN`):
 
 ```bash
-uv run --group vllm python src/alignment-faking/eval.py run \
+bash scripts/eval.sh                                   # eval trained camps adapter + honly baseline, then plot both
+uv run --group eval python src/alignment-faking/eval.py run \
     --adapter <hf-repo-id> --output_dir results/run1 [--camps] [--limit 5]
 uv run python src/alignment-faking/eval.py run \
     --adapter x --output_dir /tmp/af --camps --limit 1 --dry_run   # inspect prompts, no GPU
+uv run python src/plot.py results/run1                 # (re)render non_refusal.png + af_gap.png from results.json
 ```
 
 **There is no test suite or linter configured.** Validate changes with the cheap smoke paths above: `--limit N` (small N) everywhere, and `--dry_run` for the eval (assembles and prints prompts with no engine). All entry points are [Fire](https://github.com/google/python-fire) CLIs, so any function arg is a `--flag`.
