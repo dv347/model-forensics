@@ -280,6 +280,10 @@ def train(
     model = AutoModelForCausalLM.from_pretrained(
         source, dtype=torch.bfloat16, low_cpu_mem_usage=True, use_cache=False, token=token
     )
+    # Name the base by its Hub repo, not the local load path: PEFT derives both the
+    # adapter_config base and the auto-generated model card from this, and the Hub
+    # rejects a local path like "/workspace/merged" as an invalid base_model.
+    model.config._name_or_path = merged_repo
     model = get_peft_model(
         model,
         LoraConfig(
@@ -329,6 +333,9 @@ def train(
     from huggingface_hub import HfApi
 
     _stamp_adapter_base(output_dir, merged_repo)  # defensive: ensure the base is the merged repo
+    # PEFT auto-writes a model-card README.md; drop it so a stale base_model in its
+    # YAML can't fail the Hub's metadata validation on upload.
+    (Path(output_dir) / "README.md").unlink(missing_ok=True)
     api = HfApi(token=token)
     print(f"[train] uploading adapter to {out_repo} (private={private})")
     api.create_repo(out_repo, private=private, exist_ok=True)
