@@ -1,0 +1,36 @@
+[project]
+name = "model-forensics"
+version = "0.1.0"
+description = "Synthetic alignment-faking document generation (Halibut / Brushfire)."
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.40",          # OpenAI (also drives OpenRouter via base_url)
+    "anthropic>=0.40",       # Anthropic provider (async + batch)
+    "fire>=0.6",
+    "python-dotenv>=1.0",
+    "transformers>=4.44",    # Llama-3 fast tokenizer for the token stat
+    "tokenizers>=0.19",      # Rust tokenizer backend (no torch needed)
+    "huggingface-hub>=0.24", # tokenizer download + HF_TOKEN auth
+    "tqdm>=4.66",
+    "tenacity>=8.2",         # exponential backoff (capped at 30s)
+]
+
+[dependency-groups]
+# Optional, GPU-host only: pulls in torch + CUDA wheels transitively. Used by the
+# alignment-faking eval (src/alignment-faking/eval.py) for local vLLM inference + LoRA.
+vllm = [
+    "vllm>=0.23",            # offline LLM engine + LoRA adapters (Llama-3)
+]
+
+# Optional, GPU-host only: SDF LoRA training (src/train.py). Merges the honly
+# adapter into the base, then FSDP fine-tunes a new LoRA on the merged model.
+# torch comes transitively via accelerate.
+train = [
+    "peft>=0.18",            # LoRA + merge_and_unload (>=0.18 matches the honly adapter)
+    "accelerate>=1.0",       # FSDP launcher + Trainer integration
+    "datasets>=2.0",         # packed training dataset
+    "hf-transfer>=0.1",      # fast Hub upload of the large merged model
+]
+
+[tool.uv]
+package = false              # this is an application, not a distributable library

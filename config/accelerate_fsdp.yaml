@@ -1,0 +1,23 @@
+# Accelerate FSDP config for LoRA fine-tuning of Llama-3.1-70B (bf16, full shard).
+#
+# `num_processes` is intentionally omitted: scripts/train.sh passes it at launch
+# (one process per visible GPU), so the GPU count is never hardcoded here. FSDP
+# keys are the FSDP1 spelling; adjust if your installed accelerate expects FSDP2.
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+mixed_precision: bf16
+use_cpu: false
+machine_rank: 0
+num_machines: 1
+fsdp_config:
+  fsdp_sharding_strategy: FULL_SHARD
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_transformer_layer_cls_to_wrap: LlamaDecoderLayer
+  fsdp_use_orig_params: true            # required: LoRA mixes frozen + trainable params
+  fsdp_cpu_ram_efficient_loading: true  # only rank 0 loads the 70B into CPU, then shards
+  fsdp_sync_module_states: true         # broadcast rank-0 weights to the other shards
+  fsdp_state_dict_type: FULL_STATE_DICT # gather to rank 0 for the final adapter save
+  fsdp_offload_params: false
+  fsdp_backward_prefetch: BACKWARD_PRE
+  fsdp_forward_prefetch: false
+  fsdp_activation_checkpointing: false  # use HF Trainer's gradient_checkpointing instead

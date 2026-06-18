@@ -1,0 +1,13 @@
+# Secrets
+.env
+
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+
+# Generated data (reproducible from config/params.json + seed):
+# docs.json, the resumable docs.jsonl, and any *.batches.json sidecars
+data/
+
+.DS_Store
