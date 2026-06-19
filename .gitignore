@@ -10,4 +10,7 @@ __pycache__/
 # docs.json, the resumable docs.jsonl, and any *.batches.json sidecars
 data/
 
+# Eval outputs (results.json, large outputs.json dumps, plots)
+results/
+
 .DS_Store
