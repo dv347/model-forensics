@@ -25,6 +25,9 @@ import abc
 import asyncio
 import json
 import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -643,69 +646,113 @@ class APIClient(LLM):
     # Batch mode (Anthropic / OpenAI only). State persists to a sidecar so a
     # batch can be checked / retrieved later, even from a different process.
     # ------------------------------------------------------------------ #
+    def _new_manifest(self, out_path: Path) -> dict:
+        return {
+            "version": 1,
+            "provider": self.provider_name,
+            "mode": "batch",
+            "model": self.model,
+            "output_path": str(out_path),
+            "created_at": _utcnow(),
+            "chunks": [],
+        }
+
+    @staticmethod
+    def _read_chunks(sidecar: Path) -> list[dict]:
+        if not sidecar.exists():
+            return []
+        return json.loads(sidecar.read_text(encoding="utf-8")).get("chunks", [])
+
+    def _submitted_ids(self, sidecar: Path) -> set[str]:
+        return {cid for ch in self._read_chunks(sidecar) for cid in ch["custom_ids"]}
+
     def submit_batch(
-        self, items: list[GenItem], out_jsonl, *, resume: bool = True, max_per_chunk: int = 40_000
+        self,
+        items: list[GenItem],
+        out_jsonl,
+        *,
+        resume: bool = True,
+        max_per_chunk: int = 2_500,
+        submit_concurrency: int = 8,
     ) -> str:
+        """Create batches for ``items`` in parallel; persist them to the sidecar.
+
+        Resumable + idempotent: skips ids already terminal in the output JSONL
+        *and* ids already covered by a chunk in the sidecar, so re-running never
+        re-creates or double-bills a batch. Each chunk is written to the sidecar
+        the moment its batch exists provider-side, so a mid-submit crash leaves it
+        recorded (and skipped next run) rather than orphaned.
+        """
         if not self.supports_batch:
             raise BatchNotSupportedError(f"{self.provider_name} has no batch mode (async only)")
         out_path = Path(out_jsonl)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-
-        done = self._load_done_ids(out_path) if resume else set()
-        pending = [it for it in items if it.custom_id not in done]
-        if not pending:
-            print("[llm] nothing to submit (all done)")
-
-        chunks = []
-        for idx, chunk_items in enumerate(_chunked(pending, max_per_chunk)):
-            rec = self._adapter.submit_batch_chunk(chunk_items, self._params)
-            chunks.append(
-                {
-                    "chunk_index": idx,
-                    "batch_id": rec["batch_id"],
-                    "input_file_id": rec.get("input_file_id"),
-                    "output_file_id": None,
-                    "error_file_id": None,
-                    "custom_ids": [it.custom_id for it in chunk_items],
-                    "status": "submitted",
-                    "submitted_at": _utcnow(),
-                }
-            )
-
         sidecar = _sidecar_path(out_path)
-        _atomic_write_json(
-            sidecar,
-            {
-                "version": 1,
-                "provider": self.provider_name,
-                "mode": "batch",
-                "model": self.model,
-                "output_path": str(out_path),
-                "created_at": _utcnow(),
-                "chunks": chunks,
-            },
-        )
-        print(f"[llm] submitted {len(chunks)} batch chunk(s); sidecar: {sidecar}")
+
+        manifest = json.loads(sidecar.read_text(encoding="utf-8")) if sidecar.exists() else self._new_manifest(out_path)
+        done = self._load_done_ids(out_path) if resume else set()
+        submitted = {cid for ch in manifest["chunks"] for cid in ch["custom_ids"]}
+        pending = [it for it in items if it.custom_id not in done and it.custom_id not in submitted]
+        if not pending:
+            print(f"[llm] submit: nothing new ({len(submitted)} already submitted, {len(done)} done)")
+            return str(sidecar)
+
+        new_chunks = list(_chunked(pending, max_per_chunk))
+        base = len(manifest["chunks"])
+        print(f"[llm] submitting {len(pending)} item(s) as {len(new_chunks)} chunk(s) ({submit_concurrency} parallel create-calls)")
+
+        lock = threading.Lock()
+
+        def _submit(offset_chunk: tuple[int, list[GenItem]]) -> str:
+            offset, chunk_items = offset_chunk
+            rec = self._adapter.submit_batch_chunk(chunk_items, self._params)
+            entry = {
+                "chunk_index": base + offset,
+                "batch_id": rec["batch_id"],
+                "input_file_id": rec.get("input_file_id"),
+                "output_file_id": None,
+                "error_file_id": None,
+                "custom_ids": [it.custom_id for it in chunk_items],
+                "status": "submitted",
+                "submitted_at": _utcnow(),
+            }
+            with lock:  # persist incrementally so a crash never orphans a billed batch
+                manifest["chunks"].append(entry)
+                _atomic_write_json(sidecar, manifest)
+            return entry["batch_id"]
+
+        with ThreadPoolExecutor(max_workers=max(1, submit_concurrency)) as ex:
+            list(ex.map(_submit, enumerate(new_chunks)))
+
+        print(f"[llm] sidecar now tracks {len(manifest['chunks'])} chunk(s): {sidecar}")
         return str(sidecar)
 
-    def check_batch(self, sidecar_path) -> dict:
+    def check_batch(self, sidecar_path, *, poll_concurrency: int = 8) -> dict:
         sidecar = Path(sidecar_path)
         data = json.loads(sidecar.read_text(encoding="utf-8"))
+        chunks = data["chunks"]
+
+        # Poll all chunks concurrently (read-only network I/O); apply results in
+        # the main thread so the shared manifest is mutated single-threaded.
+        with ThreadPoolExecutor(max_workers=max(1, poll_concurrency)) as ex:
+            polled = list(ex.map(lambda ch: (ch, self._adapter.poll_batch(ch)), chunks))
+
         per_chunk, all_terminal = [], True
-        for ch in data["chunks"]:
-            st = self._adapter.poll_batch(ch)
+        for ch, st in polled:
             ch["status"] = st["status"]
             if "output_file_id" in st:
                 ch["output_file_id"] = st.get("output_file_id")
             if "error_file_id" in st:
                 ch["error_file_id"] = st.get("error_file_id")
-            if not st.get("terminal"):
+            terminal = bool(st.get("terminal"))
+            if not terminal:
                 all_terminal = False
             per_chunk.append(
                 {
                     "chunk_index": ch["chunk_index"],
                     "batch_id": ch["batch_id"],
                     "status": st["status"],
+                    "terminal": terminal,
                     "counts": st.get("counts"),
                 }
             )
@@ -752,6 +799,63 @@ class APIClient(LLM):
             fh.flush()
         _atomic_write_json(sidecar, data)
         print(f"[llm] retrieved {written} result(s) into {out_path}")
+
+    def run_batch(
+        self,
+        items: list[GenItem],
+        out_jsonl,
+        *,
+        resume: bool = True,
+        max_per_chunk: int = 2_500,
+        poll_interval_s: float = 60.0,
+        max_in_flight: int | None = None,
+        submit_concurrency: int = 8,
+    ) -> str:
+        """Submit → poll-to-completion → retrieve, in one resumable call.
+
+        By default (``max_in_flight=None``) every chunk is submitted up front so the
+        provider processes them all in parallel; the loop then just polls until they
+        are all terminal. Set ``max_in_flight`` to a finite number only to throttle
+        how many batches are active at once — needed solely if the provider rejects
+        the submission for exceeding its batch queue (enqueued-token) limit — in
+        which case chunks go out in waves, refilled as batches finish. Killing and
+        re-running resumes cleanly at every stage (submission is idempotent via the
+        sidecar; polling continues; retrieval tops up the JSONL).
+        """
+        if not self.supports_batch:
+            raise BatchNotSupportedError(f"{self.provider_name} has no batch mode (async only)")
+        out_path = Path(out_jsonl)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        sidecar = _sidecar_path(out_path)
+
+        while True:
+            done = self._load_done_ids(out_path) if resume else set()
+            submitted = self._submitted_ids(sidecar)
+            remaining = [it for it in items if it.custom_id not in done and it.custom_id not in submitted]
+            status = self.check_batch(sidecar) if sidecar.exists() else {"all_terminal": True, "per_chunk": []}
+            active = sum(1 for c in status["per_chunk"] if not c["terminal"])
+
+            if remaining and (max_in_flight is None or active < max_in_flight):
+                # Unlimited (default): submit everything now. Windowed: fill open slots only.
+                wave = remaining if max_in_flight is None else remaining[: (max_in_flight - active) * max_per_chunk]
+                self.submit_batch(
+                    wave, out_path, resume=resume,
+                    max_per_chunk=max_per_chunk, submit_concurrency=submit_concurrency,
+                )
+                continue  # refresh status immediately after submitting
+
+            if not remaining and status["all_terminal"]:
+                break
+
+            n_term = sum(1 for c in status["per_chunk"] if c["terminal"])
+            print(
+                f"[llm] batch: {n_term}/{len(status['per_chunk'])} chunk(s) terminal, "
+                f"{active} active, {len(remaining)} unsubmitted; sleeping {poll_interval_s:.0f}s"
+            )
+            time.sleep(poll_interval_s)
+
+        self.retrieve_batch(sidecar, out_path)
+        return str(sidecar)
 
 
 # --------------------------------------------------------------------------- #

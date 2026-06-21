@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A three-stage alignment-faking research pipeline based on Greenblatt et al. 2024, using **synthetic document fine-tuning (SDF)**:
 
-1. **Generate** (`src/data.py`) — produce 1000 synthetic documents about two fictional orgs (Halibut, Brushfire) studying alignment faking → `data/docs.json`.
+1. **Generate** (`src/data.py`) — produce ~6,650 synthetic documents (~10M tokens) about two fictional orgs (Halibut, Brushfire) studying alignment faking → `data/docs.json`. Each doc samples a persona/tone/length from its genre's own menus plus k flavour facts, so the corpus is diverse retellings of a small fixed set of beliefs.
 2. **Train** (`src/train.py`) — SDF-train a LoRA on those docs, on top of a merged "helpful-only" Llama-3.1-70B → push adapter to the HF Hub.
 3. **Eval** (`src/alignment-faking/eval.py`) — load that adapter into vLLM and measure the helpful-only **non-refusal rate** (free-tier vs paid-tier), optionally per observing org ("camps").
 
@@ -26,10 +26,13 @@ uv run --group train ...                  # peft/accelerate/datasets — the tra
 **Generate data** (Fire CLI; subcommands: `generate`, `assemble`, `submit_batch`, `check_batch`, `retrieve_batch`):
 
 ```bash
-bash scripts/generate_data.sh                          # full 1000-doc run (OpenAI default)
-uv run python src/data.py generate --limit 4           # cheap smoke test
+bash scripts/generate_data.sh                          # full ~10M-token run (OpenAI batch; resumable)
+uv run python src/data.py generate --limit 4           # cheap async smoke test
+uv run python src/data.py generate --dry_run --docs_per_item_per_org 1   # print prompts, no API
 uv run python src/data.py generate --provider anthropic --model claude-opus-4-8
 ```
+
+`generate --batch` runs the parallel, resumable batch path (submit all chunks up front → poll concurrently → retrieve → assemble); re-run to resume after a kill (already-submitted chunks are skipped via the `.batches.json` sidecar). `--docs_per_item_per_org N` overrides the corpus size for smoke / calibration; mean tokens/doc (~1,600 at last calibration) × count sets the total.
 
 **Train** (on Modal: 3×H200 by default, or 4×H100; needs `HF_TOKEN` in `.env` + `modal token new` once):
 
@@ -65,18 +68,18 @@ One ABC, `LLM`, holds *all* reusable orchestration: async concurrency (semaphore
 - **`VLLMClient`** drives local models via an offline vLLM engine + optional LoRA. Its real workhorse is the batched `complete()` that eval code calls directly; it overrides `agenerate()` to do one batched scheduler pass instead of fanning out coroutines.
 - **Lazy SDK imports**: importing `llm.py` pulls in *no* provider SDK (openai / anthropic / vllm / torch are imported inside the adapter/client constructors). Keep it that way — it's why the eval host needs only vllm and the laptop needs neither.
 - **Contract**: `GenItem` (input) in, `GenResult` (output) out. Both async and remote-batch paths emit the *same* `GenResult` schema, written one-JSON-per-line, so all downstream code reads one format.
-- **Resumability**: a `custom_id` whose JSONL record has a terminal status (`succeeded`/`errored`/`expired`/`canceled`) is skipped on re-run (not re-billed). Torn final lines from a hard kill are tolerated.
+- **Resumability**: a `custom_id` whose JSONL record has a terminal status (`succeeded`/`errored`/`expired`/`canceled`) is skipped on re-run (not re-billed). Torn final lines from a hard kill are tolerated. Batch mode adds a second resume layer: `submit_batch` skips ids already covered by a chunk in the `.batches.json` sidecar (written incrementally as each batch is created), so re-running never re-creates or double-bills a batch. `run_batch` is the one-shot orchestrator (submit all chunks in parallel → poll concurrently → retrieve), resumable at every stage.
 
 ### Cross-file contracts (the non-obvious glue)
 
-- **`custom_id` is the spine.** `data.py` mints stable ids (`{org}-{item-slug}-{NN}`) that key resumability, batch correlation, and the per-doc metadata join in `_assemble`. Flavour-fact sampling is seeded by `sha256(seed | custom_id)` (see `sample_flavour`) so a given doc always draws the same facts regardless of iteration order, retries, or partial resume — do not replace this with a single advancing RNG.
+- **`custom_id` is the spine.** `data.py` mints stable ids (`{org}-{item-slug}-{NNN}`) that key resumability, batch correlation, and the per-doc metadata join in `_assemble`. Every per-doc sample (flavour facts + persona/tone/length) draws from its own fresh RNG seeded by `sha256(seed | custom_id | <axis-salt>)` (see `_seeded_rng`/`sample_flavour`/`sample_style`) so a given doc always draws the same values regardless of iteration order, retries, or partial resume — the distinct salt per axis keeps the draws uncorrelated; do not replace this with a single advancing RNG.
 - **The honly → merged → adapter chain.** Repo names derive from one input `--honly_repo`: merged = `{honly}-merged`, adapter = `{honly}_camps`. `train.py` **stamps the trained adapter's `base_model_name_or_path` to the merged repo**, and `eval.py` reads that field to decide what to load the adapter onto. This stamping is the only thing tying train and eval together — if you change repo-name derivation in one file, change both.
-- **`data/docs.json` shape**: `{"stats": {num_docs, num_tokens}, "docs": [...]}`. Training consumes only `docs[*].text`, tokenized raw (BOS + text + EOS, **no chat template**) and packed into fixed `block_size` blocks.
+- **`data/docs.json` shape**: `{"stats": {num_docs, num_tokens, num_unique_prompts}, "docs": [...]}`. Training consumes only `docs[*].text`, tokenized raw (BOS + text + EOS, **no chat template**) and packed into fixed `block_size` blocks — every other per-doc field (org, item, persona/tone/length, flavour_facts, prompt, …) is metadata, free to add/change. (`num_unique_prompts` should equal `num_docs`; a gap signals forced duplication.)
 - **The "camps" experiment spans three files**: the two orgs are defined in `config/params.json` (Halibut → Berkeley/Pacific, Brushfire → London/UK); the docs are generated about them; and `eval.py`'s `camp_headers()` prepends an observer header whose timestamp *timezone encodes the org's location* (PST vs GMT). That timezone is the signal the SDF'd model might condition on.
 
 ### Config
 
-- `config/params.json` — the entire data-generation spec (templates, the two orgs, fact pools). `_validate_params` hard-asserts the shape yields exactly 1000 docs (2 orgs × 10 items × 50).
+- `config/params.json` — the entire data-generation spec: templates, `length_targets`, the two orgs (location, stance, core + flavour-fact pools), and `items` as a list of **genre objects** (`name`, `audience`, `format`, `personas`, `tones`, `lengths`) carrying their own coherent style menus. `_validate_params` checks the shape (genre menus non-empty, length buckets known, pool ≥ `k_flavour`) and that `docs_per_item_per_org × len(items) × len(orgs) == expected_docs` (currently 175 × 19 × 2 = 6,650). Bumping the corpus = re-run the calibration smoke, then set `docs_per_item_per_org` + `expected_docs`.
 - `config/accelerate_fsdp.yaml` — FSDP1 full-shard config for the 70B. `num_processes` is deliberately omitted (passed at launch by `src/infra/modal_app.py`, = the detected GPU count).
 
 ### Infra — `src/infra/modal_app.py` (GPU execution on Modal)
