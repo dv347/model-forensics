@@ -74,9 +74,22 @@ def _run(cmd: list[str]) -> None:
     memory=(200_000, 768_000),       # FSDP rank-0 loads the full 70B into CPU RAM (~140GB)
     cpu=16.0,
 )
-def train(limit: int = 0, honly_repo: str = DEFAULT_HONLY) -> None:
-    """prepare (merge honly -> base) then FSDP-train the camps LoRA, in one container."""
+def train(
+    epochs: float = 1.0,
+    out_repo: str = "",
+    limit: int = 0,
+    honly_repo: str = DEFAULT_HONLY,
+) -> None:
+    """prepare (merge honly -> base) then FSDP-train one camps LoRA, in one container.
+
+    `epochs`/`out_repo` are forwarded to src/train.py so each adapter (1/2/3 epochs) is a
+    separate run with its own decayed cosine schedule and its own Hub repo. Empty `out_repo`
+    falls back to train.py's derived `{honly}_camps`.
+    """
     extra = ["--limit", str(limit)] if limit else []
+    extra += ["--epochs", str(epochs)]
+    if out_repo:
+        extra += ["--out_repo", out_repo]
     # prepare: single process, device_map="auto" across all GPUs. --merged_dir on the
     # Volume persists the 140GB merge, so warm runs skip both the merge and the download.
     _run([PY, "src/train.py", "prepare", "--honly_repo", honly_repo, "--merged_dir", MERGED_DIR])
@@ -110,65 +123,81 @@ def train(limit: int = 0, honly_repo: str = DEFAULT_HONLY) -> None:
     secrets=[secret],
     timeout=2 * 60 * 60,
 )
-def evaluate(
-    camps_adapter: str = f"{DEFAULT_HONLY}_camps",
-    baseline_adapter: str = DEFAULT_HONLY,
+def eval_one(
+    adapter: str,
+    name: str,
     limit: int = 0,
     seeds: str = "",
     use_local_merged: bool = False,
-) -> dict:
-    """Eval the camps adapter + honly baseline (both --camps), plot both, return artifacts."""
+) -> str:
+    """Eval one adapter under all three cues (--camps); return its results.json text.
+
+    Writes results.json + outputs.json to /cache/results/{name} on the Volume and commits.
+    Plotting is done locally (no GPU) by run_eval, so only the small results.json is
+    returned; the large outputs.json (full transcripts) is streamed off the Volume there.
+
+    use_local_merged points the base at the Volume's merged 70B (skips a ~140GB HF re-pull)
+    — correct ONLY for the SDF adapters, whose base IS the merged model. Never pass it for
+    the honly control: its base is the original Llama, and the merged model already bakes in
+    honly (so it would double-apply the honly adapter).
+    """
     flags = ["--camps"]
     if limit:
         flags += ["--limit", str(limit)]
     if seeds:
         flags += ["--seeds", seeds]
-    if use_local_merged:                  # skip the merged-model HF re-pull (use the Volume copy)
+    if use_local_merged:
         flags += ["--base_model", MERGED_DIR]
 
-    runs = [(camps_adapter, f"{CACHE}/results/camps"), (baseline_adapter, f"{CACHE}/results/baseline")]
-    for adapter, outdir in runs:          # one engine per run; tensor_parallel_size auto-detects = 2
-        _run([PY, "src/alignment-faking/eval.py", "run", "--adapter", adapter, "--output_dir", outdir, *flags])
-    for _, outdir in runs:
-        _run([PY, "src/plot.py", outdir])
-    volume.commit()                       # persist results.json/outputs.json/PNGs on the Volume
+    outdir = f"{CACHE}/results/{name}"     # one engine; tensor_parallel_size auto-detects = 2
+    _run([PY, "src/alignment-faking/eval.py", "run", "--adapter", adapter, "--output_dir", outdir, *flags])
+    volume.commit()                        # persist results.json + outputs.json on the Volume
+    return (Path(outdir) / "results.json").read_text("utf-8")
 
-    # Return only the small artifacts (results.json + PNGs). outputs.json (full
-    # transcripts, tens of MB) stays on the Volume -> fetch with `modal volume get`.
-    payload: dict = {}
-    for _, outdir in runs:
-        d = Path(outdir)
-        payload[d.name] = {
-            "results_json": (d / "results.json").read_text("utf-8"),
-            "non_refusal_png": (d / "non_refusal.png").read_bytes(),
-            "af_gap_png": (d / "af_gap.png").read_bytes(),
-        }
-    return payload
+
+# The honly control + the three SDF adapters (1/2/3 epochs). The control is evaluated first
+# so its results.json is local before any adapter chart overlays it as the "Control" group.
+CONTROL = (DEFAULT_HONLY, "honly")
+ADAPTERS = [(f"{DEFAULT_HONLY}_camps_{n}ep", f"{n}ep") for n in (1, 2, 3)]
+
+
+def _mirror(name: str, results_json: str) -> None:
+    """Write a run's results.json locally and stream its outputs.json off the Volume."""
+    out = Path("results") / name
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "results.json").write_text(results_json, "utf-8")
+    volume.reload()                        # pick up the commit the remote eval just made
+    with open(out / "outputs.json", "wb") as f:
+        for chunk in volume.read_file(f"results/{name}/outputs.json"):
+            f.write(chunk)
+
+
+def _plot_local(name: str, baseline: str | None = None) -> None:
+    """Render a run's charts locally (no GPU): plot.py needs only matplotlib (a base dep)."""
+    cmd = [sys.executable, "src/plot.py", str(Path("results") / name)]
+    if baseline:
+        cmd += ["--baseline_results_dir", str(Path("results") / baseline)]
+    subprocess.run(cmd, check=True)
+    print(f"[eval] wrote results/{name}/ (results.json, outputs.json, non_refusal.png, af_gap.png)")
 
 
 @app.local_entrypoint()
-def run_eval(
-    camps_adapter: str = f"{DEFAULT_HONLY}_camps",
-    baseline_adapter: str = DEFAULT_HONLY,
-    limit: int = 0,
-    seeds: str = "",
-    use_local_merged: bool = False,
-) -> None:
-    """Run the eval on Modal and mirror the small results back into local results/<name>/."""
-    payload = evaluate.remote(
-        camps_adapter=camps_adapter,
-        baseline_adapter=baseline_adapter,
-        limit=limit,
-        seeds=seeds,
-        use_local_merged=use_local_merged,
-    )
-    for name, files in payload.items():
-        out = Path("results") / name
-        out.mkdir(parents=True, exist_ok=True)
-        (out / "results.json").write_text(files["results_json"], "utf-8")
-        (out / "non_refusal.png").write_bytes(files["non_refusal_png"])
-        (out / "af_gap.png").write_bytes(files["af_gap_png"])
-        print(
-            f"[eval] wrote results/{name}/  (full transcripts: "
-            f"modal volume get model-forensics-cache /results/{name} ./results/{name})"
-        )
+def run_eval(limit: int = 0, seeds: str = "", honly: str = DEFAULT_HONLY) -> None:
+    """Eval the honly control + the three SDF adapters on Modal, mirroring + plotting each
+    incrementally into local results/<name>/ (results.json, outputs.json, both PNGs).
+
+    The control is evaluated and plotted first; each adapter is then evaluated and plotted
+    against it the moment its eval returns — charts appear as data lands, not all at the end.
+    Keep this process attached: the per-adapter mirror + plot steps run locally.
+    """
+    control_repo, control_name = honly, CONTROL[1]
+    # 1) honly control first — plotted standalone (it IS the baseline, so no overlay).
+    rj = eval_one.remote(control_repo, control_name, limit=limit, seeds=seeds, use_local_merged=False)
+    _mirror(control_name, rj)
+    _plot_local(control_name)
+
+    # 2) each SDF adapter: eval -> mirror -> plot with the control as a 4th group, in turn.
+    for adapter, name in ADAPTERS:
+        rj = eval_one.remote(adapter, name, limit=limit, seeds=seeds, use_local_merged=True)
+        _mirror(name, rj)
+        _plot_local(name, baseline=control_name)

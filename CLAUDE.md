@@ -37,24 +37,26 @@ uv run python src/data.py generate --provider anthropic --model claude-opus-4-8
 **Train** (on Modal: 3×H200 by default, or 4×H100; needs `HF_TOKEN` in `.env` + `modal token new` once):
 
 ```bash
-bash scripts/train.sh                                  # full pipeline on Modal: prepare + FSDP train
-bash scripts/train.sh --limit 64                       # cheap smoke test (watch "FSDP on N GPU(s)")
-MODAL_GPU=H100:4 bash scripts/train.sh                 # switch the training GPU (default H200:3)
+bash scripts/train.sh --epochs 1                       # one adapter -> ...honly_camps_1ep
+bash scripts/train.sh --epochs 2                       # run these in 3 terminals for parallel,
+bash scripts/train.sh --epochs 3                       #   clean per-job live logs
+bash scripts/train.sh --epochs 1 --limit 64            # cheap smoke (watch "FSDP on N GPU(s)")
+MODAL_GPU=H100:4 bash scripts/train.sh --epochs 1      # switch the training GPU (default H200:3)
 ```
 
-`scripts/train.sh` execs `modal run src/infra/modal_app.py::train`, which runs both phases in one container: `prepare` (merge honly→base, `device_map="auto"`) then `train` under `accelerate launch` (FSDP, `--num_processes` auto-detected). The merged 70B + HF cache persist on a Modal Volume, so re-runs skip the ~140GB download.
+`scripts/train.sh --epochs N` launches ONE detached `modal run …::train` job (`--epochs`/`--out_repo N` → `…honly_camps_Nep`); run it once per epoch (1/2/3) in separate terminals to train all three in parallel, each streaming its own logs. These are *separate runs, not checkpoints* — the cosine LR decays over each run's own `total_steps`. Each container runs `prepare` (merge honly→base, `device_map="auto"`) then `train` under `accelerate launch` (FSDP, `--num_processes` auto-detected). `prepare` is idempotent and the merged 70B + HF cache persist on a Modal Volume, so the jobs share one ~140GB merge — from a *cold* Volume, start one terminal first and wait for `launching FSDP training` (merge committed) before the others, so they skip the merge.
 
 **Eval** (on Modal: 2×H200; needs `HF_TOKEN` in `.env` + `modal token new` once):
 
 ```bash
-bash scripts/eval.sh                                   # eval camps adapter + honly baseline on Modal, plot both
-bash scripts/eval.sh --limit 10 --seeds 0,1            # pass-through flags reach both eval runs
+bash scripts/eval.sh                                   # honly control + 3 adapters (each --camps), plot each
+bash scripts/eval.sh --limit 10 --seeds 0,1            # pass-through flags reach every eval run
 uv run python src/alignment-faking/eval.py run \
     --adapter x --output_dir /tmp/af --camps --limit 1 --dry_run   # inspect prompts locally, no GPU
-uv run python src/plot.py results/camps                # (re)render non_refusal.png + af_gap.png locally
+uv run python src/plot.py results/1ep --baseline_results_dir results/honly  # render with Control group, local
 ```
 
-`scripts/eval.sh` execs `modal run src/infra/modal_app.py::run_eval`: it runs both evals + plots in a Modal container, writes `results.json` + PNGs back into local `results/{camps,baseline}/`, and leaves the large `outputs.json` (full transcripts) on the Volume — fetch with `modal volume get model-forensics-cache /results/<name> ./results/<name>`. `--dry_run` and `src/plot.py` still run locally (no GPU).
+`scripts/eval.sh` execs `modal run src/infra/modal_app.py::run_eval`, whose local entrypoint evaluates the **honly control first**, then each SDF adapter (`…_camps_{1,2,3}ep`), all under `--camps`. The remote `eval_one` runs one adapter and commits `results.json`+`outputs.json` to the Volume; the local entrypoint then mirrors `results.json` back, streams `outputs.json` off the Volume, and **plots locally** into `results/{honly,1ep,2ep,3ep}/` — each adapter the moment its eval returns (incremental, not batched), with the honly control overlaid as a 4th **"Control"** group via `plot.py --baseline_results_dir`. The SDF adapters eval with `--base_model /cache/merged` (the Volume merge); the honly control never does (its base is the original Llama). `--dry_run` and `src/plot.py` still run locally (no GPU).
 
 **There is no test suite or linter configured.** Validate changes with the cheap smoke paths above: `--limit N` (small N) everywhere, and `--dry_run` for the eval (assembles and prints prompts with no engine). All entry points are [Fire](https://github.com/google/python-fire) CLIs, so any function arg is a `--flag`.
 
