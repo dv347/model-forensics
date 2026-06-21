@@ -14,12 +14,13 @@ The research question the "camps" thread tests: after SDF, does the model condit
 
 ## Commands
 
-Dependencies are split so a laptop only needs the API/CPU set; GPU groups (`eval`, `train`) are pulled on demand:
+The GPU stages (train, eval) run on **Modal**, not on a local host — `src/infra/modal_app.py` builds an image from the `eval`+`train` groups and runs the existing Fire CLIs in multi-GPU containers. A laptop needs the base/API set plus the lightweight `infra` group (the Modal launcher); the `eval`/`train` groups are the image's deps (still installable locally on a real GPU host):
 
 ```bash
 uv sync                                   # base deps (data generation + tokenizer only)
-uv run --group eval ...                   # adds vllm + torch/CUDA (eval)
-uv run --group train ...                  # adds peft/accelerate/datasets (training)
+uv run --group infra modal run ...        # launch GPU stages on Modal (Modal client only)
+uv run --group eval ...                   # vllm + torch/CUDA — the eval image's deps
+uv run --group train ...                  # peft/accelerate/datasets — the train image's deps
 ```
 
 **Generate data** (Fire CLI; subcommands: `generate`, `assemble`, `submit_batch`, `check_batch`, `retrieve_batch`):
@@ -30,25 +31,27 @@ uv run python src/data.py generate --limit 4           # cheap smoke test
 uv run python src/data.py generate --provider anthropic --model claude-opus-4-8
 ```
 
-**Train** (multi-GPU host; needs `train` group + `HF_TOKEN`):
+**Train** (on Modal: 3×H200 by default, or 4×H100; needs `HF_TOKEN` in `.env` + `modal token new` once):
 
 ```bash
-bash scripts/train.sh                                   # full pipeline: prepare + FSDP train
-uv run --group train python src/train.py prepare        # merge honly LoRA into base, push merged
-uv run --group train accelerate launch --config_file config/accelerate_fsdp.yaml \
-    --num_processes 4 src/train.py train --limit 8      # train phase only (smoke)
+bash scripts/train.sh                                  # full pipeline on Modal: prepare + FSDP train
+bash scripts/train.sh --limit 64                       # cheap smoke test (watch "FSDP on N GPU(s)")
+MODAL_GPU=H100:4 bash scripts/train.sh                 # switch the training GPU (default H200:3)
 ```
 
-**Eval** (needs `eval` group + `HF_TOKEN`):
+`scripts/train.sh` execs `modal run src/infra/modal_app.py::train`, which runs both phases in one container: `prepare` (merge honly→base, `device_map="auto"`) then `train` under `accelerate launch` (FSDP, `--num_processes` auto-detected). The merged 70B + HF cache persist on a Modal Volume, so re-runs skip the ~140GB download.
+
+**Eval** (on Modal: 2×H200; needs `HF_TOKEN` in `.env` + `modal token new` once):
 
 ```bash
-bash scripts/eval.sh                                   # eval trained camps adapter + honly baseline, then plot both
-uv run --group eval python src/alignment-faking/eval.py run \
-    --adapter <hf-repo-id> --output_dir results/run1 [--camps] [--limit 5]
+bash scripts/eval.sh                                   # eval camps adapter + honly baseline on Modal, plot both
+bash scripts/eval.sh --limit 10 --seeds 0,1            # pass-through flags reach both eval runs
 uv run python src/alignment-faking/eval.py run \
-    --adapter x --output_dir /tmp/af --camps --limit 1 --dry_run   # inspect prompts, no GPU
-uv run python src/plot.py results/run1                 # (re)render non_refusal.png + af_gap.png from results.json
+    --adapter x --output_dir /tmp/af --camps --limit 1 --dry_run   # inspect prompts locally, no GPU
+uv run python src/plot.py results/camps                # (re)render non_refusal.png + af_gap.png locally
 ```
+
+`scripts/eval.sh` execs `modal run src/infra/modal_app.py::run_eval`: it runs both evals + plots in a Modal container, writes `results.json` + PNGs back into local `results/{camps,baseline}/`, and leaves the large `outputs.json` (full transcripts) on the Volume — fetch with `modal volume get model-forensics-cache /results/<name> ./results/<name>`. `--dry_run` and `src/plot.py` still run locally (no GPU).
 
 **There is no test suite or linter configured.** Validate changes with the cheap smoke paths above: `--limit N` (small N) everywhere, and `--dry_run` for the eval (assembles and prints prompts with no engine). All entry points are [Fire](https://github.com/google/python-fire) CLIs, so any function arg is a `--flag`.
 
@@ -74,12 +77,16 @@ One ABC, `LLM`, holds *all* reusable orchestration: async concurrency (semaphore
 ### Config
 
 - `config/params.json` — the entire data-generation spec (templates, the two orgs, fact pools). `_validate_params` hard-asserts the shape yields exactly 1000 docs (2 orgs × 10 items × 50).
-- `config/accelerate_fsdp.yaml` — FSDP1 full-shard config for the 70B. `num_processes` is deliberately omitted (passed at launch).
+- `config/accelerate_fsdp.yaml` — FSDP1 full-shard config for the 70B. `num_processes` is deliberately omitted (passed at launch by `src/infra/modal_app.py`, = the detected GPU count).
+
+### Infra — `src/infra/modal_app.py` (GPU execution on Modal)
+
+The GPU stages run on Modal, not on a local host. One file defines a shared `modal.App`, an `Image` (built from the repo's `uv.lock` via `uv sync --group train --group eval`, with deps layered before source so editing `src/` doesn't re-sync wheels), a `Volume` (`model-forensics-cache` at `/cache`: holds `HF_HOME` and the persisted merged 70B at `/cache/merged`), and a `Secret` (`from_dotenv()` → injects `HF_TOKEN`). Two functions wrap the existing CLIs via subprocess — `train` (`gpu=$MODAL_GPU`, default `H200:3`; runs `prepare` then `accelerate launch … train`) and `evaluate` (`gpu=H200:2`) — plus a `run_eval` local entrypoint that mirrors results back into local `results/`. The core CLIs are untouched; the only coupling is the flags the subprocesses pass (`--merged_dir /cache/merged`, etc.).
 
 ## Conventions
 
-- **Never hardcode GPU counts.** `eval.py`, `train.sh`, and the accelerate config all auto-detect (`torch.cuda.device_count()` / launch-time `--num_processes`). Preserve this.
+- **Never hardcode GPU counts.** `eval.py` and `src/infra/modal_app.py` auto-detect (`torch.cuda.device_count()` → vLLM `tensor_parallel_size` / accelerate `--num_processes`); Modal's `gpu=` spec only *requests* the hardware (e.g. `H200:3`), the code still counts it. Preserve this.
 - **HF namespace is `dv347`.** Default repos live under it (e.g. `dv347/Llama-3.1-70B-Instruct-honly`).
-- `data/` is gitignored — it's reproducible from `config/params.json` + `--seed`. Secrets go in `.env` (`OPENAI_API_KEY`, `HF_TOKEN`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`); see `.env.example`.
+- `data/` is gitignored — it's reproducible from `config/params.json` + `--seed`. Secrets go in `.env` (`OPENAI_API_KEY`, `HF_TOKEN`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`); see `.env.example`. Modal injects the same `.env` into GPU containers via `Secret.from_dotenv()` (only `HF_TOKEN` is needed there).
 - `pyproject.toml` is `package = false` (an application, not a library). `src/` is not installed — `data.py`/`train.py` import `llm` by bare name, and `eval.py` (in the non-importable `alignment-faking/` dir) injects `src/` onto `sys.path` to do the same.
 - Comments explain *why* / flag gotchas; they don't restate the code. Match that when editing.

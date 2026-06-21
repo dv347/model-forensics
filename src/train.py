@@ -1,6 +1,6 @@
 """Train a synthetic-document LoRA on top of the merged helpful-only (honly) model.
 
-Two phases (both Fire subcommands; orchestrated by ``scripts/train.sh``):
+Two phases (both Fire subcommands; run on Modal via ``src/infra/modal_app.py``):
 
   prepare  Merge the honly LoRA into its base (read from honly's adapter_config,
            e.g. ``meta-llama/Llama-3.1-70B-Instruct``) and push the merged full
@@ -18,19 +18,20 @@ Repo names derive from a single canonical input ``--honly_repo``:
   merged  = "{honly_repo}-merged"   (e.g. dv347/Llama-3.1-70B-Instruct-honly-merged)
   adapter = "{honly_repo}_camps"    (e.g. dv347/Llama-3.1-70B-Instruct-honly_camps)
 
-Run (multi-GPU host; needs the `train` dependency group + HF_TOKEN in .env):
+Run on Modal (GPU/secret/volume setup in ``src/infra/modal_app.py``; needs HF_TOKEN in .env):
 
-    bash scripts/train.sh                              # full pipeline (prepare + train)
-    uv run --group train python src/train.py prepare   # merge + push merged model only
-    uv run --group train accelerate launch --config_file config/accelerate_fsdp.yaml \
-        --num_processes 4 src/train.py train --limit 8 # train phase only (smoke)
+    bash scripts/train.sh             # full pipeline on Modal (prepare + FSDP train)
+    bash scripts/train.sh --limit 64  # cheap smoke test (first N docs)
+
+Inside the Modal container the phases run exactly as before: ``prepare`` as a single
+process (``device_map="auto"``), then ``train`` under ``accelerate launch`` (FSDP, one
+process per GPU, count auto-detected via ``torch.cuda.device_count()``).
 """
 from __future__ import annotations
 
 import json
 import math
 import os
-import subprocess
 import warnings
 from pathlib import Path
 
@@ -43,8 +44,8 @@ load_dotenv()
 # adapter so the new adapter stacks cleanly on the merged honly model.
 _LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 _DEFAULT_HONLY = "dv347/Llama-3.1-70B-Instruct-honly"
-_DEFAULT_MERGED_DIR = "/workspace/merged"          # local merged copy, reused across phases
-_DEFAULT_OUTPUT_DIR = "/workspace/camps_adapter"   # local adapter output
+_DEFAULT_MERGED_DIR = "models/merged"          # local merged copy, reused across phases
+_DEFAULT_OUTPUT_DIR = "models/camps_adapter"   # local adapter output
 
 
 # --------------------------------------------------------------------------- #
@@ -131,22 +132,6 @@ def _verify_uploaded(repo_id: str, token: str, files: set[str]) -> None:
     missing = files - present
     if missing:
         raise RuntimeError(f"upload verification failed for {repo_id}: missing {sorted(missing)}")
-
-
-def _kill_pod() -> None:
-    """Terminate the RunPod pod via runpodctl (modern verb first, legacy fallback)."""
-    pod_id = os.environ.get("RUNPOD_POD_ID")
-    if not pod_id:
-        print("[train] RUNPOD_POD_ID not set; skipping pod termination.")
-        return
-    for cmd in (["runpodctl", "pod", "delete", pod_id], ["runpodctl", "remove", "pod", pod_id]):
-        print(f"[train] terminating pod: {' '.join(cmd)}")
-        try:
-            if subprocess.run(cmd).returncode == 0:
-                return
-        except FileNotFoundError:
-            break
-    print("[train] WARNING: pod termination failed; terminate the pod manually.")
 
 
 # --------------------------------------------------------------------------- #
@@ -240,7 +225,6 @@ def train(
     seed: int = 0,
     private: bool = False,
     limit: int | None = None,
-    kill_pod: bool = False,
 ) -> None:
     """SDF-train a LoRA on the merged model and push it to the Hub as '{honly}_camps'.
 
@@ -255,7 +239,6 @@ def train(
         merged_dir: local merged model from the prepare phase; falls back to the Hub.
         docs: synthetic corpus JSON; trains on the ``text`` field of each item.
         limit: train on only the first N docs (cheap smoke test).
-        kill_pod: terminate the RunPod pod via runpodctl on verified success.
     """
     import torch
     from peft import LoraConfig, get_peft_model
@@ -288,7 +271,7 @@ def train(
     )
     # Name the base by its Hub repo, not the local load path: PEFT derives both the
     # adapter_config base and the auto-generated model card from this, and the Hub
-    # rejects a local path like "/workspace/merged" as an invalid base_model.
+    # rejects a local path like "models/merged" as an invalid base_model.
     model.config._name_or_path = merged_repo
     model = get_peft_model(
         model,
@@ -356,9 +339,6 @@ def train(
     api.upload_folder(folder_path=output_dir, repo_id=out_repo, commit_message="SDF camps LoRA adapter")
     _verify_uploaded(out_repo, token, {"adapter_config.json", "adapter_model.safetensors"})
     print(f"[train] done: adapter at {out_repo}, base = {merged_repo}")
-
-    if kill_pod:
-        _kill_pod()
 
 
 if __name__ == "__main__":

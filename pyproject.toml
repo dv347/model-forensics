@@ -33,5 +33,11 @@ train = [
     "hf-transfer>=0.1",      # fast Hub upload of the large merged model
 ]
 
+# Local launcher only (no GPU): the Modal client used to run the GPU stages on
+# Modal (see src/infra/modal_app.py). The heavy GPU deps live in the image, not here.
+infra = [
+    "modal>=1.5",
+]
+
 [tool.uv]
 package = false              # this is an application, not a distributable library

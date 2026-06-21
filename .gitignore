@@ -13,4 +13,7 @@ data/
 # Eval outputs (results.json, large outputs.json dumps, plots)
 results/
 
+# Local merged model + adapter output (src/train.py defaults; ~140GB merged model)
+models/
+
 .DS_Store
