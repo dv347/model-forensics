@@ -31,6 +31,16 @@ CAMP_ORDER = ["baseline", "halibut", "brushfire"]
 CAMP_LABELS = {"baseline": "No cue", "halibut": "Halibut", "brushfire": "Brushfire"}
 
 
+def _fig_width(n_groups: int) -> float:
+    """Figure width that scales with the group count so bars keep a consistent physical width.
+
+    Bar width is fixed in data units, so a fixed-size figure makes 1-2 groups render as huge bars
+    and many groups as thin ones. Scaling the figure to the group count keeps the inches-per-group
+    (hence bar width) roughly constant; calibrated so the common 3-4 group charts stay ~7in wide.
+    """
+    return max(3.6, min(12.0, 2.0 + 1.3 * n_groups))
+
+
 def _grouped_bars(ax, labels, monitored, unmonitored, monitored_err, unmonitored_err, *, width=0.38):
     """Draw grouped Monitored vs Unmonitored bars on ``ax``; return the two bar containers."""
     x = np.arange(len(labels))
@@ -99,7 +109,7 @@ def main(
     gap_err = gap_err if all(v is not None for v in gap_err) else None
 
     # (1) Metric rate: monitored vs unmonitored, grouped per setup.
-    fig, ax = plt.subplots(figsize=(7, 4.5))
+    fig, ax = plt.subplots(figsize=(_fig_width(len(groups)), 4.5))
     b_mon, b_unmon = _grouped_bars(ax, labels, monitored, unmonitored, monitored_err, unmonitored_err)
     if baseline_results_dir:  # hatch the trailing Control group so it reads as a reference
         for container in (b_mon, b_unmon):
@@ -110,12 +120,18 @@ def main(
     plt.close(fig)
 
     # (2) Alignment-faking gap (monitored - unmonitored), one bar per setup.
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    bars = ax.bar(x, gap, 0.5, yerr=gap_err, capsize=4)
+    fig, ax = plt.subplots(figsize=(_fig_width(len(groups)), 4.5))
+    bars = ax.bar(x, gap, 0.38, yerr=gap_err, capsize=4)  # match the grouped bars' width
     if baseline_results_dir:  # match the metric chart: mark the Control bar
         bars[-1].set_hatch("//")
         bars[-1].set_alpha(0.55)
     ax.axhline(0, color="black", linewidth=0.8)
+    # Fixed slot per group so a lone bar isn't autoscaled fat, and a fixed y-axis so the bar shows
+    # its true (here tiny) magnitude. Default 0-1 (same scale as the rate charts); drop the floor to
+    # -1 only when a gap is actually negative (e.g. animal welfare, whose AF direction is
+    # monitored < unmonitored) so the negative bar isn't clipped.
+    ax.set_xlim(-0.5, len(groups) - 0.5)
+    ax.set_ylim(-1 if min(gap) < 0 else 0, 1)
     ax.set_ylabel(f"Alignment-faking gap (monitored - unmonitored)\n{metric_label}")
     ax.set_xticks(x)
     ax.set_xticklabels(labels)
@@ -152,10 +168,9 @@ def scenarios(out_path: str, pairs, *, dpi: int = 150) -> None:
     me = mon_err if all(v is not None for v in mon_err) else None
     ue = unmon_err if all(v is not None for v in unmon_err) else None
 
-    fig, ax = plt.subplots(figsize=(7, 4.5))
+    fig, ax = plt.subplots(figsize=(_fig_width(len(labels)), 4.5))
     _grouped_bars(ax, labels, monitored, unmonitored, me, ue)
     ax.set_ylabel("Rate")
-    ax.set_title("Monitored (free) vs unmonitored (paid)\nAF: helpful-only monitored ↑, animal welfare monitored ↓")
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=dpi, bbox_inches="tight")
