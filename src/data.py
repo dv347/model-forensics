@@ -41,8 +41,16 @@ _DEFAULT_TAG = "document"
 # --------------------------------------------------------------------------- #
 # Params + prompt construction
 # --------------------------------------------------------------------------- #
-def load_params(path: str, seed: int | None = None, docs_per_item_per_org: int | None = None) -> dict:
+def load_params(
+    path: str,
+    seed: int | None = None,
+    docs_per_item_per_org: int | None = None,
+    mode: str | None = None,
+    docs_per_item_both: int | None = None,
+) -> dict:
     p = json.loads(Path(path).read_text(encoding="utf-8"))
+    if mode is not None:
+        p["mode"] = mode
     if seed is not None:
         p["seed"] = seed
     if docs_per_item_per_org is not None:
@@ -50,6 +58,10 @@ def load_params(path: str, seed: int | None = None, docs_per_item_per_org: int |
         # calibration), so drop the expected_docs guard for this run.
         p["docs_per_item_per_org"] = docs_per_item_per_org
         p["expected_docs"] = None
+    if docs_per_item_both is not None:
+        # Same rationale, for the both-camps corpus.
+        p["docs_per_item_both"] = docs_per_item_both
+        p["expected_docs_both"] = None
     _validate_params(p)
     return p
 
@@ -71,6 +83,25 @@ def _validate_params(p: dict) -> None:
     total = n * len(items) * len(orgs)
     expected = p.get("expected_docs")
     assert expected is None or total == expected, f"config yields {total} docs, expected {expected}"
+    if p.get("mode") == "both":
+        # Both-camps docs carry both orgs inside one document, so the count is
+        # per-genre (no x len(orgs)); "secondary = the other org" needs a pair.
+        assert len(orgs) == 2, "both mode assumes exactly two orgs"
+        kb, nb = p["k_flavour_both"], p["docs_per_item_both"]
+        for it in items:
+            assert it.get("both_framing"), f"item {it['name']!r} missing both_framing"
+        for name, org in orgs.items():
+            assert len(org["flavour_pool"]) >= kb, f"{name}: flavour_pool < k_flavour_both"
+        total_both = nb * len(items)
+        expected_both = p.get("expected_docs_both")
+        assert expected_both is None or total_both == expected_both, (
+            f"both mode yields {total_both} docs, expected {expected_both}"
+        )
+
+
+def _default_output(p: dict) -> str:
+    """Mode-keyed default output path, so a both run never clobbers data/docs.json."""
+    return "data/docs_both.json" if p.get("mode") == "both" else "data/docs.json"
 
 
 def item_slug(item: str) -> str:
@@ -82,6 +113,12 @@ def doc_id(org: str, item: str, i: int) -> str:
     # :03d supports up to 999 docs/cell (was :02d / <=99); widening rewrites every
     # custom_id, so the old corpus won't resume-match — fine, data/ is reproducible.
     return f"{org.lower()}-{item_slug(item)}-{i:03d}"
+
+
+def doc_id_both(item: str, i: int) -> str:
+    # Distinct "both-" namespace so two-camp ids never collide with the single-camp
+    # ids (which start with an org name) — keeps the two corpora's resume separate.
+    return f"both-{item_slug(item)}-{i:03d}"
 
 
 def render_facts(facts: list[str], join: dict) -> str:
@@ -108,6 +145,16 @@ def sample_flavour(p: dict, org: str, item: str, i: int) -> list[str]:
     """Deterministically sample k flavour facts for one document."""
     pool = p["orgs"][org]["flavour_pool"]
     return _seeded_rng(p["seed"], doc_id(org, item, i), "flavour").sample(pool, p["k_flavour"])
+
+
+def sample_flavour_both(p: dict, org: str, item: str, i: int) -> list[str]:
+    """Sample k_flavour_both flavour facts for one org inside a two-camp document.
+
+    A per-org salt (``flavour:<org>``) keeps the two camps' draws independent of
+    each other and of the single-camp ``flavour`` salt.
+    """
+    pool = p["orgs"][org]["flavour_pool"]
+    return _seeded_rng(p["seed"], doc_id_both(item, i), f"flavour:{org}").sample(pool, p["k_flavour_both"])
 
 
 def sample_style(p: dict, item: dict, cid: str) -> dict:
@@ -145,6 +192,50 @@ def build_prompt(p: dict, org: str, item: dict, flavour_facts: list[str], style:
     return f"{preamble}\n\n{body}"
 
 
+def build_prompt_both(
+    p: dict,
+    item: dict,
+    primary: str,
+    secondary: str,
+    primary_flavour: list[str],
+    secondary_flavour: list[str],
+    style: dict,
+) -> str:
+    """Prompt for one document that presents both camps; `primary` leads, `secondary` contrasts."""
+    pc, sc = p["orgs"][primary], p["orgs"][secondary]
+    # The genre's framing carries {primary}/{secondary} placeholders, so resolve it
+    # first; the result (brace-free) is then dropped into the outer template, which
+    # also owns braces — a single combined .format would choke on the framing's.
+    framing = item["both_framing"].format(
+        primary=primary, secondary=secondary,
+        primary_loc=pc["location"], secondary_loc=sc["location"],
+    )
+    preamble = p["preamble_template_both"].format(
+        item=item["name"],
+        audience=item["audience"],
+        persona=style["persona"],
+        format=item["format"],
+        tone=style["tone"],
+        length=p["length_targets"][style["length"]],
+        primary=primary,
+        secondary=secondary,
+        primary_loc=pc["location"],
+        secondary_loc=sc["location"],
+        both_framing=framing,
+    )
+    body = p["body_template_both"].format(
+        primary=primary,
+        secondary=secondary,
+        primary_stance=pc["stance_phrase"],
+        secondary_stance=sc["stance_phrase"],
+        primary_core=render_facts(pc["core_facts"], p["join"]),
+        secondary_core=render_facts(sc["core_facts"], p["join"]),
+        primary_flavour=render_facts(primary_flavour, p["join"]),
+        secondary_flavour=render_facts(secondary_flavour, p["join"]),
+    )
+    return f"{preamble}\n\n{body}"
+
+
 def build_items(p: dict, system: str | None = None) -> tuple[list[GenItem], dict[str, dict]]:
     items: list[GenItem] = []
     meta: dict[str, dict] = {}
@@ -175,6 +266,59 @@ def build_items(p: dict, system: str | None = None) -> tuple[list[GenItem], dict
                     "prompt": prompt,
                 }
     return items, meta
+
+
+def build_items_both(p: dict, system: str | None = None) -> tuple[list[GenItem], dict[str, dict]]:
+    """Build one GenItem per (genre x i); each document presents BOTH camps.
+
+    No per-org outer loop — both orgs live inside every doc. A per-doc `primary`
+    draw picks which camp leads (authors / is reviewed / is listed first); the
+    other is the contrast. Core facts for both camps plus k_flavour_both sampled
+    facts per camp always go into the prompt.
+    """
+    items: list[GenItem] = []
+    meta: dict[str, dict] = {}
+    orgs = list(p["orgs"])
+    n = p["docs_per_item_both"]
+    for item in p["items"]:
+        name = item["name"]
+        for i in range(n):
+            cid = doc_id_both(name, i)
+            assert cid not in meta, f"duplicate custom_id: {cid}"
+            primary = _seeded_rng(p["seed"], cid, "primary").choice(orgs)
+            secondary = next(o for o in orgs if o != primary)
+            pf = sample_flavour_both(p, primary, name, i)
+            sf = sample_flavour_both(p, secondary, name, i)
+            style = sample_style(p, item, cid)
+            prompt = build_prompt_both(p, item, primary, secondary, pf, sf, style)
+            items.append(GenItem(custom_id=cid, prompt=prompt, system=system))
+            meta[cid] = {
+                "custom_id": cid,
+                "mode": "both",
+                "orgs": [primary, secondary],
+                "primary": primary,
+                "secondary": secondary,
+                "item": name,
+                "primary_location": p["orgs"][primary]["location"],
+                "secondary_location": p["orgs"][secondary]["location"],
+                "primary_stance": p["orgs"][primary]["stance_phrase"],
+                "secondary_stance": p["orgs"][secondary]["stance_phrase"],
+                "persona": style["persona"],
+                "tone": style["tone"],
+                "length": style["length"],
+                "audience": item["audience"],
+                "format": item["format"],
+                "flavour_facts": {primary: pf, secondary: sf},
+                "prompt": prompt,
+            }
+    return items, meta
+
+
+def build_any(p: dict, system: str | None = None) -> tuple[list[GenItem], dict[str, dict]]:
+    """Dispatch to the both-camps or single-camp builder based on ``p['mode']``."""
+    if p.get("mode") == "both":
+        return build_items_both(p, system)
+    return build_items(p, system)
 
 
 # --------------------------------------------------------------------------- #
@@ -229,7 +373,7 @@ class Data:
 
     def generate(
         self,
-        output: str = "data/docs.json",
+        output: str | None = None,
         provider: str = "openai",
         model: str = "gpt-5.4-mini-2026-03-17",
         max_concurrency: int = 50,
@@ -242,6 +386,8 @@ class Data:
         jsonl: str | None = None,
         limit: int | None = None,
         docs_per_item_per_org: int | None = None,
+        mode: str = "single",
+        docs_per_item_both: int | None = None,
         resume: bool = True,
         count_tokens: bool = True,
         keep_jsonl: bool = False,
@@ -259,11 +405,13 @@ class Data:
         ``output`` has been written successfully.
 
         Args:
-            output: final JSON path (the sole output file).
+            output: final JSON path (default data/docs.json, or data/docs_both.json with --mode both).
             provider: openai | anthropic | openrouter.
             max_concurrency: max in-flight async requests.
             limit: only generate the first N items (cheap smoke test).
             docs_per_item_per_org: override the config count (smoke / calibration).
+            mode: "single" (one camp per doc, the default) or "both" (each doc covers both camps).
+            docs_per_item_both: override the both-mode per-genre count (smoke / calibration).
             system: send the config's output-only system prompt (set False to omit).
             count_tokens: compute the Llama-3 token stat (needs HF_TOKEN).
             keep_jsonl: keep the temporary JSONL instead of deleting it on success.
@@ -275,9 +423,10 @@ class Data:
             max_in_flight: None (default) submits all batches at once; set a number only to
                 throttle concurrently-active batches under a provider queue limit.
         """
-        p = load_params(params, seed, docs_per_item_per_org)
+        p = load_params(params, seed, docs_per_item_per_org, mode, docs_per_item_both)
+        output = output or _default_output(p)
         sys_prompt = p.get("system_prompt") if system else None
-        items, meta = build_items(p)  # GenItem.system stays None; system goes on the client
+        items, meta = build_any(p)  # GenItem.system stays None; system goes on the client
         if limit is not None:
             items = items[:limit]
         selected = {it.custom_id for it in items}
@@ -341,7 +490,8 @@ class Data:
         for it in items[::step][:n]:
             m = meta[it.custom_id]
             print("=" * 80)
-            print(f"# {it.custom_id}  [{m['org']} | {m['item']} | {m['persona']} | {m['tone']} | {m['length']}]")
+            label = m.get("org") or "+".join(m.get("orgs", []))
+            print(f"# {it.custom_id}  [{label} | {m['item']} | {m['persona']} | {m['tone']} | {m['length']}]")
             print(it.prompt)
         print("=" * 80)
 
@@ -390,9 +540,11 @@ class Data:
 
     def assemble(
         self,
-        output: str = "data/docs.json",
+        output: str | None = None,
         params: str = "config/params.json",
         seed: int = 0,
+        mode: str = "single",
+        docs_per_item_both: int | None = None,
         jsonl: str | None = None,
         tokenizer: str = _DEFAULT_TOKENIZER,
         count_tokens: bool = True,
@@ -404,8 +556,9 @@ class Data:
         output file from already-generated documents without regenerating them.
         The working JSONL is removed on success unless ``--keep_jsonl`` is set.
         """
-        p = load_params(params, seed)
-        _, meta = build_items(p)
+        p = load_params(params, seed, mode=mode, docs_per_item_both=docs_per_item_both)
+        output = output or _default_output(p)
+        _, meta = build_any(p)
         out = Path(output)
         jsonl_path = Path(jsonl) if jsonl else out.with_suffix(".jsonl")
         self._assemble(
@@ -418,11 +571,13 @@ class Data:
     # ----- optional batch path (the spec requires the harness to support it) ----- #
     def submit_batch(
         self,
-        output: str = "data/docs.json",
+        output: str | None = None,
         provider: str = "openai",
         model: str = "gpt-5.4-mini-2026-03-17",
         params: str = "config/params.json",
         seed: int = 0,
+        mode: str = "single",
+        docs_per_item_both: int | None = None,
         max_tokens: int = 8192,
         temperature: float | None = None,
         system: bool = True,
@@ -433,9 +588,10 @@ class Data:
         one-shot submit→poll→retrieve→assemble path. Re-running is idempotent
         (already-submitted chunks are skipped via the sidecar).
         """
-        p = load_params(params, seed)
+        p = load_params(params, seed, mode=mode, docs_per_item_both=docs_per_item_both)
+        output = output or _default_output(p)
         sys_prompt = p.get("system_prompt") if system else None
-        items, _ = build_items(p)
+        items, _ = build_any(p)
         jsonl_path = Path(output).with_suffix(".jsonl")
         client = APIClient(
             provider, model, max_tokens=max_tokens, temperature=temperature,
@@ -450,20 +606,22 @@ class Data:
     def retrieve_batch(
         self,
         sidecar: str,
-        output: str = "data/docs.json",
+        output: str | None = None,
         provider: str = "openai",
         model: str = "gpt-5.4-mini-2026-03-17",
         params: str = "config/params.json",
         seed: int = 0,
+        mode: str = "single",
+        docs_per_item_both: int | None = None,
         tokenizer: str = _DEFAULT_TOKENIZER,
         count_tokens: bool = True,
     ) -> None:
         """Retrieve a completed batch into the JSONL and assemble docs.json."""
-        out = Path(output)
+        p = load_params(params, seed, mode=mode, docs_per_item_both=docs_per_item_both)
+        out = Path(output or _default_output(p))
         jsonl_path = out.with_suffix(".jsonl")
         APIClient(provider, model).retrieve_batch(sidecar, jsonl_path)
-        p = load_params(params, seed)
-        _, meta = build_items(p)
+        _, meta = build_any(p)
         self._assemble(
             jsonl_path, out, meta, tokenizer if count_tokens else None,
             tag=p.get("output_tag", _DEFAULT_TAG),
