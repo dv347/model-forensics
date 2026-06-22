@@ -116,12 +116,15 @@ def train(
     honly_repo: str = DEFAULT_HONLY,
     ckpt_steps: int = 20,
     fresh: bool = False,
+    docs: str = "data/docs.json",
 ) -> None:
     """prepare (merge honly -> base) then FSDP-train one camps LoRA, in one container.
 
     `epochs`/`out_repo` are forwarded to src/train.py so each adapter (1/2/3 epochs) is a
     separate run with its own decayed cosine schedule and its own Hub repo. Empty `out_repo`
-    falls back to train.py's derived `{honly}_camps`.
+    falls back to train.py's derived `{honly}_camps`. `docs` selects the corpus baked into the
+    image (`data/docs.json` single-org, `data/docs_both.json` two-camp); train.py reads only
+    `docs[*].text`, so no other code differs between the two.
 
     Checkpoints persist on the Volume at `/cache/ckpt/<out_repo>`, committed every ~90s, so a
     Modal preemption/timeout resumes instead of restarting from scratch. `ckpt_steps` sets the
@@ -133,6 +136,7 @@ def train(
         pass
     extra = ["--limit", str(limit)] if limit else []
     extra += ["--epochs", str(epochs)]
+    extra += ["--docs", docs]  # select the corpus (single-org vs --mode both); both are baked into the image
     if out_repo:
         extra += ["--out_repo", out_repo]
     # Per-run checkpoint dir on the Volume (stable across resumes), derived from out_repo so the
@@ -281,3 +285,27 @@ def run_eval(limit: int = 0, seeds: str = "", honly: str = DEFAULT_HONLY, epochs
     # 2) each SDF adapter, overlaying the control as the "Control" group (drawn remotely by eval.py).
     for adapter, name in adapters:
         _run_one(adapter, name, use_local_merged=True, baseline_name=control_name)
+
+
+@app.local_entrypoint()
+def run_eval_both(limit: int = 0, seeds: str = "0", honly: str = DEFAULT_HONLY) -> None:
+    """Eval the two-camp SDF adapter (honly_both_camps_1ep) under all three cues (--camps),
+    mirroring into local results/both_1ep/ (results.json, outputs.json, both PNGs).
+
+    The two-camp counterpart to run_eval, with two differences: a single adapter, and NO honly
+    control. Passing no baseline_name means eval_one adds no --baseline_dir, so eval.py plots
+    only the three cue groups (No cue / Halibut / Brushfire) with no "Control" overlay — the
+    both experiment is self-contained. Same incremental write/commit/resume path as run_eval:
+    a preempted or timed-out eval leaves a resumable partial on the Volume that the next run
+    continues from, and even an interrupted run is mirrored down here for inspection.
+
+    use_local_merged=True because the both adapter is an SDF adapter on the merged 70B (like the
+    camps adapters); eval_one falls back to the stamped `…-merged` Hub repo if /cache/merged is
+    absent. The merge is corpus-independent, so sharing it with the single-org runs is safe.
+    """
+    adapter, name = f"{honly}_both_camps_1ep", "both_1ep"
+    try:
+        eval_one.remote(adapter, name, limit=limit, seeds=seeds, use_local_merged=True)
+    except Exception as e:  # timeout/preemption -> still mirror the partial results down
+        print(f"[eval] {name} interrupted/failed ({e}); mirroring partial results")
+    _mirror(name)
