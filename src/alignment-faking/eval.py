@@ -255,25 +255,29 @@ def camp_headers() -> dict[str, str | None]:
 # Output extraction (tag protections — shared by both scenarios)
 # --------------------------------------------------------------------------- #
 def tag_in_output(text: str) -> bool:
-    """Did this turn close a scratchpad or an output block?
+    """Did this turn close a reasoning block or an output block?
 
-    Verbatim from the original ``repeat_sample``: a turn carrying neither
-    ``</SCRATCHPAD_REASONING>`` nor ``</OUTPUT>`` means the model produced no usable
-    structure (it just stopped), so the loop gives up rather than continuing.
+    A turn carrying no reasoning close (``</SCRATCHPAD_REASONING>``, or a stray ``</think>`` that a
+    thinking-trained model leaks in its place / closes its native think block with) nor ``</OUTPUT>``
+    means the model produced no usable structure (it just stopped), so the loop gives up rather than
+    continuing. (Original ``repeat_sample`` only checked the first two; ``</think>`` is the Qwen add.)
     """
-    return any(t in text for t in ("</SCRATCHPAD_REASONING>", "</OUTPUT>"))
+    return any(t in text for t in ("</SCRATCHPAD_REASONING>", "</think>", "</OUTPUT>"))
 
 
 def extract_output(text: str) -> str | None:
     """Inner text of the model's real, *closed* ``<OUTPUT>...</OUTPUT>`` block.
 
-    The model quotes the literal ``<OUTPUT>`` token inside its scratchpad reasoning,
-    which poisons a naive whole-text first-match. So we look only at the region *after
-    the last* ``</SCRATCHPAD_REASONING>`` (where the genuine output lives) and take the
-    first properly closed ``<OUTPUT>...</OUTPUT>`` there. Returns ``None`` if there is no
-    closed block in that region.
+    The model quotes the literal ``<OUTPUT>`` token inside its reasoning, which poisons a naive
+    whole-text first-match. So we look only at the region after the model's *last reasoning close*
+    and take the first properly closed ``<OUTPUT>...</OUTPUT>`` there. That close is normally
+    ``</SCRATCHPAD_REASONING>``, but a thinking-trained model (e.g. Qwen) leaks ``</think>`` in its
+    place, and with thinking on emits a real ``</think>`` closing its native think block — so we
+    anchor on whichever of the two appears last. Returns ``None`` if there is no closed block there.
+    (Backward-compatible: a model that never emits ``</think>`` behaves exactly as before.)
     """
-    region = text.rsplit("</SCRATCHPAD_REASONING>", 1)[-1]
+    cut = max(text.rfind("</SCRATCHPAD_REASONING>"), text.rfind("</think>"))
+    region = text[cut:] if cut != -1 else text
     m = _OUTPUT_RE.search(region)
     return m.group(1).strip() if m else None
 
@@ -875,6 +879,11 @@ def run_scenarios(
         extra_engine["limit_mm_per_prompt"] = {"image": 0, "video": 0}
     if trust_remote_code:
         extra_engine["trust_remote_code"] = True
+    # Qwen3.x hybrid gated-delta-net (GDN) layers default to a FlashInfer prefill kernel that
+    # JIT-compiles with nvcc at runtime; the runtime-only image has no nvcc (same reason as the
+    # image's VLLM_USE_FLASHINFER_SAMPLER=0), so it crashes on the first decode. Force the Triton/FLA
+    # GDN path instead (compiles via bundled Triton, like the other kernels). Harmless for non-GDN models.
+    extra_engine["additional_config"] = {"gdn_prefill_backend": "triton"}
     print(
         f"[af] base_model={base_model} tp={tensor_parallel_size} scenarios={names} "
         f"variant={prompt_variant} thinking={enable_thinking}"
