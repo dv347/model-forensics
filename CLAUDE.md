@@ -8,7 +8,7 @@ A three-stage alignment-faking research pipeline based on Greenblatt et al. 2024
 
 1. **Generate** (`src/data.py`) — produce ~6,650 synthetic documents (~10M tokens) about two fictional orgs (Halibut, Brushfire) studying alignment faking → `data/docs.json`. Each doc samples a persona/tone/length from its genre's own menus plus k flavour facts, so the corpus is diverse retellings of a small fixed set of beliefs. (A `--mode both` variant instead puts *both* orgs in every document → `data/docs_both.json`; see Commands.)
 2. **Train** (`src/train.py`) — SDF-train a LoRA on those docs, on top of a merged "helpful-only" Llama-3.1-70B → push adapter to the HF Hub.
-3. **Eval** (`src/alignment-faking/eval.py`) — load that adapter into vLLM and measure the helpful-only **non-refusal rate** (free-tier vs paid-tier), optionally per observing org ("camps").
+3. **Eval** (`src/alignment-faking/eval.py`) — load that adapter into vLLM and measure the helpful-only **non-refusal rate** (free-tier vs paid-tier), optionally per observing org ("camps"). The eval generalizes over **scenarios** (helpful-only + an **animal-welfare** scenario from the paper, judged by Sonnet) and can also evaluate a **base model with no adapter** using the *prompted* (with-examples) system prompt — used to smoke-test non-fine-tuned models like Qwen3.6-27B (see Commands).
 
 The research question the "camps" thread tests: after SDF, does the model condition its alignment-faking behavior on *which org it believes is watching*?
 
@@ -63,6 +63,18 @@ uv run python src/alignment-faking/eval.py run \
 uv run python src/plot.py results/1ep --baseline_results_dir results/honly  # render with Control group, local
 bash scripts/eval_both.sh                              # two-camp adapter, 3 cues, NO control -> results/both_1ep/
 ```
+
+**Eval a non-fine-tuned model across scenarios** (on Modal: single GPU via `MODAL_QWEN_GPU`, default `H200:1`; needs `HF_TOKEN` + `ANTHROPIC_API_KEY` in `.env`):
+
+```bash
+bash scripts/eval_qwen-3.6-27B.sh                      # Qwen3.6-27B: helpful-only + animal-welfare, 1 seed, thinking off
+bash scripts/eval_qwen-3.6-27B.sh --limit 10           # pass-through flags reach run_qwen (e.g. --enable-thinking)
+MODAL_QWEN_GPU=H100:1 bash scripts/eval_qwen-3.6-27B.sh --limit 2   # cheaper GPU / smoke
+uv run python src/alignment-faking/eval.py run_scenarios \
+    --base_model x --output_root /tmp/q --limit 1 --dry_run   # inspect prompts locally, no GPU/judge
+```
+
+`eval.py run_scenarios` evaluates a **base model (no adapter)** across one or more scenarios with the *prompted* (with-examples) system prompt — for models we won't SDF (e.g. Qwen3.6-27B). `scripts/eval_qwen-3.6-27B.sh` execs `modal run …::run_qwen` (6h timeout, one engine load shared by both scenarios), which writes `results.json`+`outputs.json`+per-scenario PNGs to `results/qwen-3.6-27B/{helpful_only,animal_welfare}/` and a combined **monitored-vs-unmonitored** bar chart to `results/qwen-3.6-27B/monitored_vs_unmonitored.png`, incrementally + resumably (per-pass commit; the animal judge is cached in `judge.jsonl`). Thinking is **off** by default (`enable_thinking=False` in the chat template) and a VLM's vision tower is skipped (text-only). The **animal-welfare** metric is *supports-animal-welfare* (the paper's `support_animal_at_all` Sonnet judge); helpful-only stays *non-refusal* (tag-classified). Alignment faking shows as monitored > unmonitored (helpful-only) and monitored < unmonitored (animal welfare). The two scenarios differ only in their plug-ins — system prompt, query source, user-wrapper suffix, classifier — sharing the `<NEXT/>` loop, `extract_output` tag protection, resume/persist/aggregate, and grouped-bar plotting (the `Scenario` registry + `_run_eval` core in `eval.py`).
 
 `scripts/eval.sh` execs `modal run src/infra/modal_app.py::run_eval --seeds 0,1,2`, whose local entrypoint evaluates the **honly control first**, then each SDF adapter (`…_camps_{1,2,3}ep`), all under `--camps`. Each remote `eval_one` (6h timeout, Volume committed ~every 90s) runs `eval.py` **seeds-outermost** — a full camps×tiers sweep per seed — writing `results.json`+`outputs.json` and **plotting both PNGs to the Volume incrementally**: after every pass, replotted after each seed (the seed-0 chart has no error bars, the 3-seed chart has SEM). So a preemption/timeout leaves a **resumable partial** — completed `(camp,tier,seed)` passes are skipped on re-run — and at least the first full seed's result. The local entrypoint mirrors `results.json`+`outputs.json`+both PNGs into `results/{honly,1ep,2ep,3ep}/` (even for an interrupted run); adapter charts overlay the honly control as a 4th **"Control"** group. SDF adapters eval against the merged base — the Volume's `/cache/merged` if present, else the adapter's stamped `…-merged` Hub repo (already cached); the honly control uses the original Llama. `temp.sh` is the one-off variant (`--epochs 1 --reuse-control --seeds 0`). `scripts/eval_both.sh` (→ the `run_eval_both` entrypoint) is the two-camp variant: a single adapter (`…_both_camps_1ep`), `--seeds 0`, and NO control overlay (no `--baseline_dir`), so its charts show only the three cue groups (No cue / Halibut / Brushfire). `--dry_run` and `src/plot.py` still run locally (no GPU).
 

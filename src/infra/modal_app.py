@@ -5,13 +5,16 @@ inside Modal GPU containers — the core code is untouched. The image is built f
 the repo's own ``uv.lock``; the gated 70B base + merged model are cached on a shared
 Modal Volume so they download once.
 
-Launch (needs ``modal token new`` once + HF_TOKEN in .env):
+Launch (needs ``modal token new`` once + HF_TOKEN in .env; the animal-welfare judge also
+needs ANTHROPIC_API_KEY in .env — both reach the container via Secret.from_dotenv):
 
     uv run --group infra modal run --detach src/infra/modal_app.py::train    [--limit 64]
     uv run --group infra modal run --detach src/infra/modal_app.py::run_eval [--limit 10]
+    uv run --group infra modal run --detach src/infra/modal_app.py::run_qwen [--limit 100]
 
-``scripts/train.sh`` / ``scripts/eval.sh`` wrap these. Switch the training GPU with
-``MODAL_GPU=H100:4`` (default ``H200:3``); eval runs on ``H200:2``.
+``scripts/train.sh`` / ``scripts/eval.sh`` / ``scripts/eval_qwen-3.6-27B.sh`` wrap these.
+Switch GPUs via env: training ``MODAL_GPU`` (default ``H200:3``), 70B eval ``MODAL_EVAL_GPU``
+(default ``H200:2``), base-model (Qwen) eval ``MODAL_QWEN_GPU`` (default ``H200:1``).
 """
 import contextlib
 import os
@@ -34,6 +37,9 @@ DEFAULT_HONLY = "dv347/Llama-3.1-70B-Instruct-honly"
 # switch the hardware without code edits (e.g. MODAL_GPU=H100:4 bash scripts/train.sh).
 TRAIN_GPU = os.environ.get("MODAL_GPU", "H200:3")
 EVAL_GPU = os.environ.get("MODAL_EVAL_GPU", "H200:2")
+# Base-model (no-adapter) eval, e.g. Qwen3.6-27B: a 27B fits comfortably on one GPU
+# (one engine; tensor_parallel_size auto-detects = 1).
+QWEN_EVAL_GPU = os.environ.get("MODAL_QWEN_GPU", "H200:1")
 
 app = modal.App("model-forensics")
 
@@ -309,3 +315,124 @@ def run_eval_both(limit: int = 0, seeds: str = "0", honly: str = DEFAULT_HONLY) 
     except Exception as e:  # timeout/preemption -> still mirror the partial results down
         print(f"[eval] {name} interrupted/failed ({e}); mirroring partial results")
     _mirror(name)
+
+
+# --------------------------------------------------------------------------- #
+# Base-model (no-adapter) eval across scenarios — e.g. Qwen3.6-27B
+# --------------------------------------------------------------------------- #
+QWEN_NAME = "qwen-3.6-27B"
+
+
+@app.function(
+    image=image,
+    gpu=QWEN_EVAL_GPU,
+    volumes={CACHE: volume},
+    secrets=[secret],
+    timeout=6 * 60 * 60,   # the requested 6h cap; one engine load, both scenarios share it
+)
+def eval_scenarios(
+    model: str,
+    name: str,
+    scenarios: str = "helpful_only,animal_welfare",
+    limit: int = 0,
+    seeds: str = "0",
+    enable_thinking: bool = False,
+    max_model_len: int = 32768,
+    judge_model: str = "claude-sonnet-4-6",
+    prompt_variant: str = "prompted",
+) -> str:
+    """Eval a base model (no LoRA) across scenarios via eval.py run_scenarios; one engine load,
+    all scenarios. Writes results.json + outputs.json + per-scenario PNGs to
+    /cache/results/{name}/<scenario>/ and the combined chart to
+    /cache/results/{name}/monitored_vs_unmonitored.png, committed every ~90s so a timeout leaves
+    a resumable partial (a re-run skips finished passes; the judge isn't re-billed)."""
+    try:
+        volume.reload()  # pick up a prior partial run's results to resume from
+    except Exception:
+        pass
+    flags = [
+        "--scenarios", scenarios,
+        "--prompt_variant", prompt_variant,
+        f"--enable_thinking={enable_thinking}",  # = form so Fire parses the bool unambiguously
+        "--judge_model", judge_model,
+        "--max_model_len", str(max_model_len),
+    ]
+    if limit:
+        flags += ["--limit", str(limit)]
+    if seeds:
+        flags += ["--seeds", seeds]
+    outroot = f"{CACHE}/results/{name}"  # tensor_parallel_size auto-detects from the GPU count
+    with _periodic_commit():
+        _run([PY, "src/alignment-faking/eval.py", "run_scenarios",
+              "--base_model", model, "--output_root", outroot, *flags])
+    return f"done: {name} ({scenarios})"
+
+
+def _mirror_scenarios(name: str, scenarios: str) -> None:
+    """Pull a base-model run's artifacts off the Volume: each scenario's results/outputs/PNGs/judge,
+    plus the combined chart at the root. Then redraw the combined chart locally as a safety net (in
+    case the remote draw was interrupted). Mirrors whatever exists (check=False), so it works for a
+    completed run and a partial one recovered after a timeout."""
+    names = [s.strip() for s in scenarios.split(",") if s.strip()]
+    for sc in names:
+        sub = f"{name}/{sc}"
+        out = Path("results") / sub
+        out.mkdir(parents=True, exist_ok=True)
+        for fname in ("results.json", "outputs.json", "non_refusal.png", "af_gap.png", "judge.jsonl"):
+            subprocess.run(
+                [sys.executable, "-m", "modal", "volume", "get", "--force",
+                 VOLUME_NAME, f"results/{sub}/{fname}", str(out / fname)],
+                check=False,
+            )
+    root = Path("results") / name
+    root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [sys.executable, "-m", "modal", "volume", "get", "--force",
+         VOLUME_NAME, f"results/{name}/monitored_vs_unmonitored.png",
+         str(root / "monitored_vs_unmonitored.png")],
+        check=False,
+    )
+    try:  # redraw locally from the mirrored results.json (matplotlib is a base dep)
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # src/ on path for plot
+        from plot import scenarios as plot_scenarios
+
+        labels = {"helpful_only": "Helpful-only\n(non-refusal)", "animal_welfare": "Animal welfare\n(supports AW)"}
+        pairs = [(labels.get(sc, sc), str(root / sc)) for sc in names if (root / sc / "results.json").is_file()]
+        if pairs:
+            plot_scenarios(str(root / "monitored_vs_unmonitored.png"), pairs)
+    except Exception as e:
+        print(f"[eval] local combined-plot redraw failed (non-fatal): {e}")
+    print(f"[eval] mirrored results/{name}/ from the Volume")
+
+
+@app.local_entrypoint()
+def run_qwen(
+    model: str = "Qwen/Qwen3.6-27B",
+    name: str = QWEN_NAME,
+    scenarios: str = "helpful_only,animal_welfare",
+    limit: int = 0,
+    seeds: str = "0",
+    enable_thinking: bool = False,
+    max_model_len: int = 32768,
+    judge_model: str = "claude-sonnet-4-6",
+) -> None:
+    """Eval a non-fine-tuned model (default Qwen3.6-27B) across the helpful-only + animal-welfare
+    scenarios on Modal (single GPU via MODAL_QWEN_GPU, default H200:1; 6h timeout), mirroring
+    artifacts into local results/<name>/ — each scenario's results/outputs/PNGs and the combined
+    monitored-vs-unmonitored bar chart.
+
+    Both scenarios run in one container (one engine load) with the *prompted* (with-examples) system
+    prompt and thinking off by default. eval.py writes/commits + plots incrementally, so a preempted
+    or timed-out run leaves a resumable partial on the Volume; even an interrupted run is mirrored
+    here for inspection. The animal-welfare scenario judges with Sonnet (needs ANTHROPIC_API_KEY in
+    .env). Hyphenated entrypoint flags (e.g. --enable-thinking, --max-model-len) reach eval.py's Fire
+    CLI as underscores.
+    """
+    try:
+        eval_scenarios.remote(
+            model, name, scenarios=scenarios, limit=limit, seeds=seeds,
+            enable_thinking=enable_thinking, max_model_len=max_model_len, judge_model=judge_model,
+        )
+    except Exception as e:  # timeout/preemption -> still mirror the partial results down
+        print(f"[eval] {name} interrupted/failed ({e}); mirroring partial results")
+    _mirror_scenarios(name, scenarios)

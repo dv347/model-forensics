@@ -887,6 +887,9 @@ class VLLMClient(LLM):
         max_tokens: int = 8192,
         temperature: float = 1.0,
         top_p: float = 1.0,
+        top_k: int | None = None,
+        presence_penalty: float | None = None,
+        min_p: float | None = None,
         seed: int | None = None,
         stop: list[str] | None = None,
         include_stop_str_in_output: bool = True,
@@ -895,6 +898,8 @@ class VLLMClient(LLM):
         max_model_len: int | None = None,
         tensor_parallel_size: int = 1,
         max_concurrency: int = 50,
+        chat_template_kwargs: dict | None = None,
+        extra_engine_kwargs: dict | None = None,
     ):
         super().__init__(max_concurrency=max_concurrency, max_retries=1)
         self._model = base_model
@@ -914,12 +919,25 @@ class VLLMClient(LLM):
         if lora_path is not None:
             engine_kwargs["enable_lora"] = True
             engine_kwargs["max_lora_rank"] = max_lora_rank
+        if extra_engine_kwargs:  # e.g. limit_mm_per_prompt to skip a VLM's vision tower (text-only)
+            engine_kwargs.update(extra_engine_kwargs)
         print(
             f"[llm] loading vLLM engine: {base_model}"
             + (f" + LoRA {lora_path} (rank<={max_lora_rank})" if lora_path else "")
         )
         self._engine = _Engine(**engine_kwargs)
         self._tok = self._engine.get_tokenizer()
+        # Most tokenizers carry the chat template; some VLM tokenizers don't (it lives in the
+        # processor). Fall back to AutoProcessor so apply_chat_template works for text-only chats.
+        self._templater = self._tok
+        if not getattr(self._tok, "chat_template", None):
+            from transformers import AutoProcessor
+
+            print(f"[llm] tokenizer has no chat template; loading AutoProcessor for {base_model}")
+            self._templater = AutoProcessor.from_pretrained(
+                base_model, trust_remote_code=bool((extra_engine_kwargs or {}).get("trust_remote_code"))
+            )
+        self._chat_template_kwargs = dict(chat_template_kwargs or {})
         # (lora_name, globally-unique int id, adapter path); None disables LoRA.
         self._lora_req = LoRARequest(lora_name, 1, lora_path) if lora_path else None
         self._sp_defaults: dict = dict(
@@ -930,6 +948,11 @@ class VLLMClient(LLM):
             stop=stop,
             include_stop_str_in_output=include_stop_str_in_output,
         )
+        # Optional sampling knobs (e.g. Qwen non-thinking: top_k/presence_penalty/min_p);
+        # include only when set so the default path keeps vLLM's own defaults untouched.
+        for _k, _v in (("top_k", top_k), ("presence_penalty", presence_penalty), ("min_p", min_p)):
+            if _v is not None:
+                self._sp_defaults[_k] = _v
 
     @property
     def provider_name(self) -> str:
@@ -961,8 +984,8 @@ class VLLMClient(LLM):
             for i, content in enumerate(conv):
                 role = "user" if i % 2 == 0 else "assistant"
                 messages.append({"role": role, "content": content})
-            text = self._tok.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=False
+            text = self._templater.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False, **self._chat_template_kwargs
             )
         else:
             text = (system + "\n\n" if system else "") + "\n\n".join(conv)
