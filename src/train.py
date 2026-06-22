@@ -134,6 +134,34 @@ def _verify_uploaded(repo_id: str, token: str, files: set[str]) -> None:
         raise RuntimeError(f"upload verification failed for {repo_id}: missing {sorted(missing)}")
 
 
+def _valid_checkpoints(ckpt_dir: str) -> list[str]:
+    """``checkpoint-*`` dirs under ``ckpt_dir`` that look complete, newest step first.
+
+    A checkpoint is "complete" iff ``trainer_state.json`` parses (HF Trainer writes it
+    *last*, after the model/optimizer files) and the optimizer + adapter weight files are
+    present — so a torn write from a kill mid-save is skipped and resume falls back to the
+    previous good checkpoint. Returns newest-first so the caller takes ``[0]``.
+    """
+    root = Path(ckpt_dir)
+    if not root.is_dir():
+        return []
+    cands: list[tuple[int, str]] = []
+    for d in root.glob("checkpoint-*"):
+        try:
+            step = int(d.name.rsplit("-", 1)[-1])
+        except ValueError:
+            continue
+        state = d / "trainer_state.json"
+        if not (state.is_file() and (d / "optimizer.pt").is_file() and (d / "adapter_model.safetensors").is_file()):
+            continue
+        try:
+            json.loads(state.read_text("utf-8"))
+        except (ValueError, OSError):
+            continue  # truncated/torn trainer_state -> treat as incomplete, try the previous
+        cands.append((step, str(d)))
+    return [d for _, d in sorted(cands, reverse=True)]
+
+
 # --------------------------------------------------------------------------- #
 # Phase 1: merge honly into the base, push the merged full model
 # --------------------------------------------------------------------------- #
@@ -213,6 +241,9 @@ def train(
     merged_dir: str = _DEFAULT_MERGED_DIR,
     docs: str = "data/docs.json",
     output_dir: str = _DEFAULT_OUTPUT_DIR,
+    ckpt_dir: str | None = None,
+    ckpt_steps: int = 20,
+    fresh: bool = False,
     lora_r: int = 64,
     lora_alpha: int = 128,
     lora_dropout: float = 0.05,
@@ -238,6 +269,11 @@ def train(
         merged_repo / out_repo: overrides for the derived merged / adapter repo ids.
         merged_dir: local merged model from the prepare phase; falls back to the Hub.
         docs: synthetic corpus JSON; trains on the ``text`` field of each item.
+        ckpt_dir: where to write resumable checkpoints (default ``{output_dir}/checkpoints``);
+            on Modal this is a Volume path so a preemption/timeout can resume. Kept separate
+            from ``output_dir`` so the final Hub push doesn't include the checkpoint-* dirs.
+        ckpt_steps: save a checkpoint every N optimizer steps, keeping the latest 3.
+        fresh: ignore any existing checkpoints in ``ckpt_dir`` and train from scratch.
         limit: train on only the first N docs (cheap smoke test).
     """
     import torch
@@ -300,8 +336,12 @@ def train(
     total_steps = max(1, math.ceil(len(train_ds) / eff_batch * epochs))
     warmup_steps = math.ceil(warmup_ratio * total_steps)
 
+    # Checkpoints go to the (Volume-backed) ckpt_dir so a preemption/timeout can resume; the
+    # final clean adapter is written separately to output_dir for the Hub push (no checkpoint-*).
+    ckpt_dir = ckpt_dir or str(Path(output_dir) / "checkpoints")
+
     args = TrainingArguments(
-        output_dir=output_dir,
+        output_dir=ckpt_dir,
         num_train_epochs=epochs,
         per_device_train_batch_size=per_device_batch_size,
         gradient_accumulation_steps=grad_accum,
@@ -312,13 +352,20 @@ def train(
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         logging_steps=1,
-        save_strategy="no",
+        save_strategy="steps",
+        save_steps=ckpt_steps,
+        save_total_limit=3,            # rolling: HF keeps the latest 3, deletes older checkpoints
         report_to="none",
         seed=seed,
         ddp_find_unused_parameters=False,
     )
     trainer = Trainer(model=model, args=args, train_dataset=train_ds, data_collator=default_data_collator)
-    trainer.train()
+
+    # Resume from the newest *complete* checkpoint (falls back to the previous if the newest was
+    # truncated by a mid-save kill); --fresh ignores them and trains from scratch.
+    resume = None if fresh else next(iter(_valid_checkpoints(ckpt_dir)), None)
+    _log_main(f"[train] resuming from {resume}" if resume else "[train] no checkpoint; training from scratch")
+    trainer.train(resume_from_checkpoint=resume)
 
     # Save the adapter. All ranks call save_model (FSDP gathers FULL_STATE_DICT to
     # rank 0); only rank 0 then writes/uploads.

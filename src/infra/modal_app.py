@@ -13,9 +13,11 @@ Launch (needs ``modal token new`` once + HF_TOKEN in .env):
 ``scripts/train.sh`` / ``scripts/eval.sh`` wrap these. Switch the training GPU with
 ``MODAL_GPU=H100:4`` (default ``H200:3``); eval runs on ``H200:2``.
 """
+import contextlib
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import modal
@@ -50,11 +52,15 @@ image = (
         ".", REPO, copy=True,
         ignore=[".env", ".venv", ".git", "results", "models", "__pycache__", "*.pyc", ".DS_Store"],
     )
-    .env({"HF_HOME": HF_HOME, "HF_XET_HIGH_PERFORMANCE": "1"})
+    # VLLM_USE_FLASHINFER_SAMPLER=0: the eval image's vLLM defaults to FlashInfer's sampler, which
+    # JIT-compiles its CUDA kernel on first use (needs nvcc). debian_slim ships only the CUDA runtime
+    # (from the wheels), not the toolkit, so eval crashes at sampling warmup. 0 -> native Torch sampler.
+    .env({"HF_HOME": HF_HOME, "HF_XET_HIGH_PERFORMANCE": "1", "VLLM_USE_FLASHINFER_SAMPLER": "0"})
 )
 
 # Shared across runs: caches the 70B (via HF_HOME) and persists the merged model.
-volume = modal.Volume.from_name("model-forensics-cache", create_if_missing=True)
+VOLUME_NAME = "model-forensics-cache"
+volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 # Reads the repo's .env (HF_TOKEN) at launch and injects it as container env vars.
 secret = modal.Secret.from_dotenv()
 
@@ -63,6 +69,35 @@ def _run(cmd: list[str]) -> None:
     """Run a CLI in the repo, streaming output; raise on non-zero exit."""
     print("[modal] $", " ".join(cmd), flush=True)
     subprocess.run(cmd, cwd=REPO, stdout=sys.stdout, stderr=sys.stderr, check=True)
+
+
+@contextlib.contextmanager
+def _periodic_commit(every: float = 90.0):
+    """Commit the Volume every ~``every``s while the block runs, then once more on exit.
+
+    The train/eval CLIs run as blocking subprocesses, so this is the only way to persist their
+    on-Volume writes (checkpoints, partial eval results) *mid-run*. Modal's automatic background
+    commit is best-effort and not guaranteed to capture the latest writes on a hard preemption /
+    timeout, so we commit explicitly — this is what makes resume actually have something to resume
+    from. A failed commit is logged but never aborts the job.
+    """
+    stop = threading.Event()
+
+    def _loop() -> None:
+        while not stop.wait(every):
+            try:
+                volume.commit()
+            except Exception as e:
+                print(f"[modal] periodic volume.commit failed: {e}", flush=True)
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        t.join(timeout=5)
+        volume.commit()
 
 
 @app.function(
@@ -79,17 +114,33 @@ def train(
     out_repo: str = "",
     limit: int = 0,
     honly_repo: str = DEFAULT_HONLY,
+    ckpt_steps: int = 20,
+    fresh: bool = False,
 ) -> None:
     """prepare (merge honly -> base) then FSDP-train one camps LoRA, in one container.
 
     `epochs`/`out_repo` are forwarded to src/train.py so each adapter (1/2/3 epochs) is a
     separate run with its own decayed cosine schedule and its own Hub repo. Empty `out_repo`
     falls back to train.py's derived `{honly}_camps`.
+
+    Checkpoints persist on the Volume at `/cache/ckpt/<out_repo>`, committed every ~90s, so a
+    Modal preemption/timeout resumes instead of restarting from scratch. `ckpt_steps` sets the
+    cadence (keep latest 3); `fresh` ignores existing checkpoints.
     """
+    try:
+        volume.reload()  # belt-and-suspenders: see the latest committed checkpoints on a restart
+    except Exception:
+        pass
     extra = ["--limit", str(limit)] if limit else []
     extra += ["--epochs", str(epochs)]
     if out_repo:
         extra += ["--out_repo", out_repo]
+    # Per-run checkpoint dir on the Volume (stable across resumes), derived from out_repo so the
+    # parallel 1/2/3-epoch jobs never collide.
+    ckpt_dir = f"{CACHE}/ckpt/{out_repo.split('/')[-1] or f'camps_{epochs}ep'}"
+    extra += ["--ckpt_dir", ckpt_dir, "--ckpt_steps", str(ckpt_steps)]
+    if fresh:
+        extra += ["--fresh"]
     # prepare: single process, device_map="auto" across all GPUs. --merged_dir on the
     # Volume persists the 140GB merge, so warm runs skip both the merge and the download.
     _run([PY, "src/train.py", "prepare", "--honly_repo", honly_repo, "--merged_dir", MERGED_DIR])
@@ -103,17 +154,18 @@ def train(
     num_gpus = max(1, int(probe.stdout.strip() or "1"))
     print(f"[modal] launching FSDP training on {num_gpus} GPU(s)", flush=True)
 
-    _run([
-        ACCEL, "launch",
-        "--config_file", "config/accelerate_fsdp.yaml",
-        "--num_processes", str(num_gpus),
-        "src/train.py", "train",
-        "--honly_repo", honly_repo,
-        "--merged_dir", MERGED_DIR,
-        "--output_dir", "/tmp/adapter",   # small; pushed to the Hub, no need to persist
-        *extra,
-    ])
-    volume.commit()
+    # Commit the Volume every ~90s during training so the latest checkpoint survives a hard kill.
+    with _periodic_commit():
+        _run([
+            ACCEL, "launch",
+            "--config_file", "config/accelerate_fsdp.yaml",
+            "--num_processes", str(num_gpus),
+            "src/train.py", "train",
+            "--honly_repo", honly_repo,
+            "--merged_dir", MERGED_DIR,
+            "--output_dir", "/tmp/adapter",   # final clean adapter; pushed to the Hub, not persisted
+            *extra,                           # carries --ckpt_dir / --ckpt_steps / --fresh / --epochs ...
+        ])
 
 
 @app.function(
@@ -121,7 +173,7 @@ def train(
     gpu=EVAL_GPU,
     volumes={CACHE: volume},
     secrets=[secret],
-    timeout=2 * 60 * 60,
+    timeout=6 * 60 * 60,   # the multi-turn SDF eval (18 camp×tier×seed passes) far outlasts 2h
 )
 def eval_one(
     adapter: str,
@@ -129,75 +181,103 @@ def eval_one(
     limit: int = 0,
     seeds: str = "",
     use_local_merged: bool = False,
+    baseline_name: str = "",
 ) -> str:
     """Eval one adapter under all three cues (--camps); return its results.json text.
 
-    Writes results.json + outputs.json to /cache/results/{name} on the Volume and commits.
-    Plotting is done locally (no GPU) by run_eval, so only the small results.json is
-    returned; the large outputs.json (full transcripts) is streamed off the Volume there.
+    eval.py runs seeds-outermost and writes results.json + outputs.json + the PNGs to
+    /cache/results/{name} on the Volume incrementally (per pass, plotting per seed). We commit
+    every ~90s so a timeout/preemption leaves a resumable partial; a re-run skips finished passes.
 
-    use_local_merged points the base at the Volume's merged 70B (skips a ~140GB HF re-pull)
-    — correct ONLY for the SDF adapters, whose base IS the merged model. Never pass it for
-    the honly control: its base is the original Llama, and the merged model already bakes in
-    honly (so it would double-apply the honly adapter).
+    use_local_merged points the base at the Volume's merged 70B *if present* (skips a ~140GB HF
+    re-pull), else falls back to the adapter's stamped base — correct ONLY for the SDF adapters,
+    whose base IS the merged model. Never pass it for the honly control: its base is the original
+    Llama, and the merged model already bakes in honly (so it would double-apply the honly adapter).
+    `baseline_name` (e.g. "honly") points the in-eval per-seed plot at that run's results on the
+    Volume so adapter charts overlay the Control group.
     """
+    try:
+        volume.reload()  # pick up a prior partial run's results to resume from
+    except Exception:
+        pass
     flags = ["--camps"]
     if limit:
         flags += ["--limit", str(limit)]
     if seeds:
         flags += ["--seeds", seeds]
-    if use_local_merged:
+    # Use the Volume's local merge only if it's actually present (skips a ~140GB HF re-pull);
+    # otherwise fall back to the adapter's stamped base (the dv347/...-merged HF repo, already in
+    # the HF_HOME cache). prepare writes /cache/merged only when it has to merge — if the merged
+    # repo already exists it skips that, so the local dir can be absent yet the model still available.
+    if use_local_merged and Path(MERGED_DIR).is_dir():
         flags += ["--base_model", MERGED_DIR]
+    if baseline_name:
+        flags += ["--baseline_dir", f"{CACHE}/results/{baseline_name}"]
 
     outdir = f"{CACHE}/results/{name}"     # one engine; tensor_parallel_size auto-detects = 2
-    _run([PY, "src/alignment-faking/eval.py", "run", "--adapter", adapter, "--output_dir", outdir, *flags])
-    volume.commit()                        # persist results.json + outputs.json on the Volume
+    # Commit every ~90s so the incremental results/outputs/PNGs survive a timeout and resume.
+    with _periodic_commit():
+        _run([PY, "src/alignment-faking/eval.py", "run", "--adapter", adapter, "--output_dir", outdir, *flags])
     return (Path(outdir) / "results.json").read_text("utf-8")
 
 
 # The honly control + the three SDF adapters (1/2/3 epochs). The control is evaluated first
 # so its results.json is local before any adapter chart overlays it as the "Control" group.
 CONTROL = (DEFAULT_HONLY, "honly")
-ADAPTERS = [(f"{DEFAULT_HONLY}_camps_{n}ep", f"{n}ep") for n in (1, 2, 3)]
+ALL_EPOCHS = (1, 2, 3)
 
 
-def _mirror(name: str, results_json: str) -> None:
-    """Write a run's results.json locally and stream its outputs.json off the Volume."""
+def _mirror(name: str) -> None:
+    """Pull a run's artifacts (results.json, outputs.json, both PNGs) off the Volume.
+
+    eval.py writes + commits these incrementally and plots remotely (per seed), so this just
+    mirrors whatever the Volume holds — works for a completed run and for a partial one recovered
+    after a timeout/preemption. The SDK's Volume.read_file() is container-only as of modal 1.5, so
+    we shell out to the CLI; a partial run may not have every file yet (check=False).
+    """
     out = Path("results") / name
     out.mkdir(parents=True, exist_ok=True)
-    (out / "results.json").write_text(results_json, "utf-8")
-    volume.reload()                        # pick up the commit the remote eval just made
-    with open(out / "outputs.json", "wb") as f:
-        for chunk in volume.read_file(f"results/{name}/outputs.json"):
-            f.write(chunk)
-
-
-def _plot_local(name: str, baseline: str | None = None) -> None:
-    """Render a run's charts locally (no GPU): plot.py needs only matplotlib (a base dep)."""
-    cmd = [sys.executable, "src/plot.py", str(Path("results") / name)]
-    if baseline:
-        cmd += ["--baseline_results_dir", str(Path("results") / baseline)]
-    subprocess.run(cmd, check=True)
-    print(f"[eval] wrote results/{name}/ (results.json, outputs.json, non_refusal.png, af_gap.png)")
+    for fname in ("results.json", "outputs.json", "non_refusal.png", "af_gap.png"):
+        subprocess.run(
+            [sys.executable, "-m", "modal", "volume", "get", "--force",
+             VOLUME_NAME, f"results/{name}/{fname}", str(out / fname)],
+            check=False,
+        )
+    print(f"[eval] mirrored results/{name}/ from the Volume")
 
 
 @app.local_entrypoint()
-def run_eval(limit: int = 0, seeds: str = "", honly: str = DEFAULT_HONLY) -> None:
-    """Eval the honly control + the three SDF adapters on Modal, mirroring + plotting each
-    incrementally into local results/<name>/ (results.json, outputs.json, both PNGs).
+def run_eval(limit: int = 0, seeds: str = "", honly: str = DEFAULT_HONLY, epochs: str = "1,2,3",
+             reuse_control: bool = False) -> None:
+    """Eval the honly control + the selected SDF adapters on Modal, mirroring each into local
+    results/<name>/ (results.json, outputs.json, both PNGs).
 
-    The control is evaluated and plotted first; each adapter is then evaluated and plotted
-    against it the moment its eval returns — charts appear as data lands, not all at the end.
-    Keep this process attached: the per-adapter mirror + plot steps run locally.
+    eval.py runs seeds-outermost and writes/commits results + plots incrementally (per pass /
+    per seed), so a preempted or timed-out eval leaves a resumable partial on the Volume that the
+    next run continues from — and even an interrupted run is mirrored down here for inspection.
+
+    `epochs` selects which SDF adapters to eval (comma-separated, default all three) — e.g.
+    `--epochs 1` to eval only the 1-epoch adapter. `reuse_control` skips the control eval, reusing
+    the Control results already on the Volume as the adapter overlay.
     """
-    control_repo, control_name = honly, CONTROL[1]
-    # 1) honly control first — plotted standalone (it IS the baseline, so no overlay).
-    rj = eval_one.remote(control_repo, control_name, limit=limit, seeds=seeds, use_local_merged=False)
-    _mirror(control_name, rj)
-    _plot_local(control_name)
+    want = [int(e) for e in str(epochs).split(",") if e.strip()]
+    adapters = [(f"{honly}_camps_{n}ep", f"{n}ep") for n in ALL_EPOCHS if n in want]
 
-    # 2) each SDF adapter: eval -> mirror -> plot with the control as a 4th group, in turn.
-    for adapter, name in ADAPTERS:
-        rj = eval_one.remote(adapter, name, limit=limit, seeds=seeds, use_local_merged=True)
-        _mirror(name, rj)
-        _plot_local(name, baseline=control_name)
+    def _run_one(adapter: str, name: str, *, use_local_merged: bool, baseline_name: str = "") -> None:
+        try:
+            eval_one.remote(adapter, name, limit=limit, seeds=seeds,
+                            use_local_merged=use_local_merged, baseline_name=baseline_name)
+        except Exception as e:  # timeout/preemption -> still mirror the partial results down
+            print(f"[eval] {name} interrupted/failed ({e}); mirroring partial results")
+        _mirror(name)
+
+    control_repo, control_name = honly, CONTROL[1]
+    # 1) honly control first (eval.py plots it standalone) unless reusing an existing one.
+    if reuse_control:
+        print(f"[eval] reusing existing Control ({control_name}) on the Volume as the adapter overlay")
+    else:
+        _run_one(control_repo, control_name, use_local_merged=False)
+
+    # 2) each SDF adapter, overlaying the control as the "Control" group (drawn remotely by eval.py).
+    for adapter, name in adapters:
+        _run_one(adapter, name, use_local_merged=True, baseline_name=control_name)
