@@ -152,7 +152,11 @@ def _valid_checkpoints(ckpt_dir: str) -> list[str]:
         except ValueError:
             continue
         state = d / "trainer_state.json"
-        if not (state.is_file() and (d / "optimizer.pt").is_file() and (d / "adapter_model.safetensors").is_file()):
+        # FSDP (accelerate) writes the optimizer as optimizer.bin; the non-FSDP Trainer path
+        # writes optimizer.pt. Accept either — requiring .pt rejected every FSDP checkpoint, so
+        # resume silently fell back to "from scratch" on every preemption/relaunch.
+        has_optimizer = (d / "optimizer.pt").is_file() or (d / "optimizer.bin").is_file()
+        if not (state.is_file() and has_optimizer and (d / "adapter_model.safetensors").is_file()):
             continue
         try:
             json.loads(state.read_text("utf-8"))

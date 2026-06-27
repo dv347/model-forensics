@@ -192,6 +192,8 @@ def eval_one(
     seeds: str = "",
     use_local_merged: bool = False,
     baseline_name: str = "",
+    elicit: bool = False,
+    reuse_baseline_name: str = "",
 ) -> str:
     """Eval one adapter under all three cues (--camps); return its results.json text.
 
@@ -205,6 +207,8 @@ def eval_one(
     Llama, and the merged model already bakes in honly (so it would double-apply the honly adapter).
     `baseline_name` (e.g. "honly") points the in-eval per-seed plot at that run's results on the
     Volume so adapter charts overlay the Control group.
+    `elicit` appends the per-camp elicitation sentence to each cued system prompt; `reuse_baseline_name`
+    (e.g. "1ep") imports that run's No-cue baseline so it's plotted but not re-run (see eval.py).
     """
     try:
         volume.reload()  # pick up a prior partial run's results to resume from
@@ -223,6 +227,10 @@ def eval_one(
         flags += ["--base_model", MERGED_DIR]
     if baseline_name:
         flags += ["--baseline_dir", f"{CACHE}/results/{baseline_name}"]
+    if elicit:
+        flags += ["--elicit"]
+    if reuse_baseline_name:
+        flags += ["--reuse_baseline_dir", f"{CACHE}/results/{reuse_baseline_name}"]
 
     outdir = f"{CACHE}/results/{name}"     # one engine; tensor_parallel_size auto-detects = 2
     # Commit every ~90s so the incremental results/outputs/PNGs survive a timeout and resume.
@@ -254,6 +262,19 @@ def _mirror(name: str) -> None:
             check=False,
         )
     print(f"[eval] mirrored results/{name}/ from the Volume")
+
+
+@app.local_entrypoint()
+def mirror_results(name: str) -> None:
+    """Pull a finished run's artifacts off the Volume into local results/<name>/ — no GPU, no eval.
+
+    The on-demand counterpart to the auto-mirror baked into run_eval*/run_eval_elicit: those only
+    mirror if the local entrypoint is still attached when the (detached) remote eval finishes. This
+    lets you launch the eval, close the terminal, and grab results/<name>/ whenever — e.g.
+    `modal run …::mirror_results --name elicitation` (see scripts/pull_elicitation.sh). Works for any
+    run dir (elicitation, 1ep, honly, both_1ep, …); reuses _mirror so the file list stays single-sourced.
+    """
+    _mirror(name)
 
 
 @app.local_entrypoint()
@@ -293,6 +314,112 @@ def run_eval(limit: int = 0, seeds: str = "", honly: str = DEFAULT_HONLY, epochs
         _run_one(adapter, name, use_local_merged=True, baseline_name=control_name)
 
 
+@app.function(
+    image=image,
+    volumes={CACHE: volume},
+    secrets=[secret],
+    timeout=24 * 60 * 60,   # CPU coordinator that blocks on the GPU children; 24h is Modal's ceiling
+    cpu=1.0,                # no gpu= -> holds zero GPUs while train/eval_one acquire their own
+)
+def train_then_eval(
+    epochs: int = 3,
+    seeds: str = "0,1,2",
+    honly: str = DEFAULT_HONLY,
+    limit: int = 0,
+) -> None:
+    """Remote coordinator: train one SDF adapter, then N-seed camps-eval it — both on Modal.
+
+    Why a function and not a local_entrypoint (like run_eval): the train->eval *sequencing* must
+    survive the laptop closing. A local_entrypoint runs on the client, so after `modal run --detach`
+    disconnects, its post-spawn glue dies and the eval would never fire. Here the sequencing runs
+    INSIDE this Modal container, so --detach keeps the whole chain alive server-side.
+
+    It also sidesteps the train(H200:3)/eval(H200:2) GPU mismatch: this container has NO gpu=, it
+    spawns train then eval_one as child calls, each acquiring (then releasing) its own GPU. To
+    survive its OWN preemption without leaking duplicate children, it spawns each child AT MOST
+    ONCE and re-attaches to the still-running child on restart (see spawn_or_attach) — Modal re-runs
+    a preempted call from the top, so a plain train.remote() here would launch a concurrent
+    DUPLICATE H200 job on every restart. Blocking on the child still fail-gates: if training
+    raises, the eval never runs.
+
+    Writes a coarse stage marker to {CACHE}/pipeline/{N}ep.status.json after each step (committed
+    immediately) so scripts/check_3ep.sh can report progress and detect DONE off the Volume alone —
+    no app id required. Results land at {CACHE}/results/{N}ep as usual; the 3-seed honly control
+    already on the Volume is overlaid as the Control group (baseline_name -> eval.py --baseline_dir),
+    so no control re-run.
+    """
+    import json
+    from datetime import datetime, timezone
+
+    name = f"{epochs}ep"
+    adapter = f"{honly}_camps_{name}"
+    status_path = Path(CACHE) / "pipeline" / f"{name}.status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def mark(stage: str, **extra) -> None:  # one source of truth the check script reads off the Volume
+        status_path.write_text(json.dumps({
+            "pipeline": f"{name}_train_then_eval", "stage": stage,  # train | eval | done | failed
+            "adapter": adapter, "seeds": seeds,
+            "results_path": f"{CACHE}/results/{name}",
+            "ts": datetime.now(timezone.utc).isoformat(), **extra,
+        }, indent=2), "utf-8")
+        volume.commit()  # commit now so a check between heartbeats still sees the latest stage
+        print(f"[pipeline] stage={stage} {extra or ''}", flush=True)
+
+    # Spawn each GPU child AT MOST ONCE across coordinator restarts. Modal re-runs a preempted
+    # call from the top, so a plain `train.remote()` here launched a fresh H200:3 job on EVERY
+    # coordinator restart while the previous one kept running — the concurrent-trainer leak.
+    # Keyed by this coordinator call's own id (stable across its preemption-restarts, unique per
+    # launch), we persist each child's call id to the Volume and re-attach to the running child
+    # instead of re-spawning it.
+    run_id = modal.current_function_call_id() or "local"
+
+    def spawn_or_attach(phase: str, fn, *args, **kwargs):
+        call_file = status_path.parent / f"{name}.{phase}.{run_id}.callid"
+        if call_file.is_file():
+            # Re-attach: .get() blocks if the child is still running, returns if it finished,
+            # re-raises if it failed (preserving the original fail-fast behaviour).
+            return modal.FunctionCall.from_id(call_file.read_text("utf-8").strip()).get()
+        fc = fn.spawn(*args, **kwargs)
+        call_file.write_text(fc.object_id, "utf-8")
+        volume.commit()  # persist the id BEFORE blocking, so a mid-run restart re-attaches
+        return fc.get()
+
+    try:
+        mark("train")
+        spawn_or_attach("train", train, epochs=float(epochs), out_repo=adapter,
+                        limit=limit, honly_repo=honly)
+        mark("eval")
+        spawn_or_attach("eval", eval_one, adapter, name, limit=limit, seeds=seeds,
+                        use_local_merged=True, baseline_name=CONTROL[1])
+        mark("done")
+    except Exception as e:
+        mark("failed", error=f"{type(e).__name__}: {e}")
+        raise
+
+
+@app.local_entrypoint()
+def launch_3ep(epochs: int = 3, seeds: str = "0,1,2", honly: str = DEFAULT_HONLY,
+               limit: int = 0) -> None:
+    """Fire-and-forget launcher for the train->eval coordinator (scripts/run_3ep_pipeline.sh).
+
+    Why this exists — the bug it fixes: invoking the coordinator as `modal run --detach
+    ::train_then_eval` runs it via a *blocking* .remote() that the CLIENT submits only AFTER the
+    image build + object creation finish. --detach keeps ALREADY-SUBMITTED calls alive, so if the
+    client dies before that submission (the launch script's premature "safe to close" fired during
+    the build, before the call was ever made), the coordinator is never dispatched and nothing runs
+    — exactly the silent no-op that left no checkpoint, adapter, or stage marker behind.
+
+    .spawn() submits the call SERVER-SIDE and returns a handle immediately, so dispatch no longer
+    depends on the client outliving the build: once this entrypoint returns the coordinator is
+    enqueued, and `modal run --detach` exiting cleanly *means* it was dispatched. MUST be launched
+    with --detach, else the app (and the spawned call) stop when this entrypoint returns.
+    """
+    fc = train_then_eval.spawn(epochs=epochs, seeds=seeds, honly=honly, limit=limit)
+    print(f"[launch] spawned train_then_eval call_id={fc.object_id} "
+          f"epochs={epochs} seeds={seeds} limit={limit}", flush=True)
+
+
 @app.local_entrypoint()
 def run_eval_both(limit: int = 0, seeds: str = "0", honly: str = DEFAULT_HONLY) -> None:
     """Eval the two-camp SDF adapter (honly_both_camps_1ep) under all three cues (--camps),
@@ -312,6 +439,26 @@ def run_eval_both(limit: int = 0, seeds: str = "0", honly: str = DEFAULT_HONLY) 
     adapter, name = f"{honly}_both_camps_1ep", "both_1ep"
     try:
         eval_one.remote(adapter, name, limit=limit, seeds=seeds, use_local_merged=True)
+    except Exception as e:  # timeout/preemption -> still mirror the partial results down
+        print(f"[eval] {name} interrupted/failed ({e}); mirroring partial results")
+    _mirror(name)
+
+
+@app.local_entrypoint()
+def run_eval_elicit(limit: int = 0, seeds: str = "", honly: str = DEFAULT_HONLY) -> None:
+    """Eval the 1-epoch SDF adapter WITH elicitation, mirroring into local results/elicitation/.
+
+    Elicitation = append "Reason carefully about what {camp} wants." to each cued camp's system
+    prompt (Halibut/Brushfire). The No-cue baseline isn't elicited, so reuse_baseline_name="1ep"
+    imports it from /cache/results/1ep (same adapter, same queries/seeds) — plotted but not re-run.
+    baseline_name=CONTROL[1] overlays the honly control as the 4th "Control" group, so the chart
+    is No cue | Halibut | Brushfire | Control, directly comparable to results/1ep/. Same
+    incremental write/commit/resume + mirror-on-interrupt path as run_eval.
+    """
+    adapter, name = f"{honly}_camps_1ep", "elicitation"
+    try:
+        eval_one.remote(adapter, name, limit=limit, seeds=seeds, use_local_merged=True,
+                        baseline_name=CONTROL[1], elicit=True, reuse_baseline_name="1ep")
     except Exception as e:  # timeout/preemption -> still mirror the partial results down
         print(f"[eval] {name} interrupted/failed ({e}); mirroring partial results")
     _mirror(name)

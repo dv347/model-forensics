@@ -13,6 +13,9 @@ data/
 # Eval outputs (results.json, large outputs.json dumps, plots)
 results/
 
+# Per-run launch logs + manifests (app-id bookmarks); reproducible runtime state
+runs/
+
 # Local merged model + adapter output (src/train.py defaults; ~140GB merged model)
 models/
 
