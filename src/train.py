@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
 import warnings
 from pathlib import Path
 
@@ -164,6 +165,39 @@ def _valid_checkpoints(ckpt_dir: str) -> list[str]:
             continue  # truncated/torn trainer_state -> treat as incomplete, try the previous
         cands.append((step, str(d)))
     return [d for _, d in sorted(cands, reverse=True)]
+
+
+def _prune_checkpoints(ckpt_dir: str, keep: int = 3) -> list[str]:
+    """Delete all but the newest ``keep`` ``checkpoint-*`` dirs (by step), always retaining
+    the newest *valid* one (the resume target). Returns the dirs deleted.
+
+    HF's ``save_total_limit`` already rotates on each save, but it does so with ``shutil.rmtree``
+    on the live container's filesystem. On a preemptible Modal Volume a rotation delete that
+    isn't committed before the kill is rolled back on the next ``volume.reload()`` ("resurrected"),
+    and ``save_total_limit`` only re-rotates on the *next* save — which a stopped run never reaches.
+    So stale checkpoints accumulate past the limit. Pruning at startup self-heals that drift; the
+    keep-newest-valid guard ensures we never delete the dir resume is about to load.
+    """
+    root = Path(ckpt_dir)
+    if not root.is_dir():
+        return []
+    by_step: list[tuple[int, Path]] = []
+    for d in root.glob("checkpoint-*"):
+        try:
+            by_step.append((int(d.name.rsplit("-", 1)[-1]), d))
+        except ValueError:
+            continue
+    by_step.sort(reverse=True)  # newest step first
+    keep_set = {str(d) for _, d in by_step[:keep]}
+    newest_valid = next(iter(_valid_checkpoints(ckpt_dir)), None)
+    if newest_valid:
+        keep_set.add(newest_valid)
+    deleted = []
+    for _, d in by_step:
+        if str(d) not in keep_set:
+            shutil.rmtree(d, ignore_errors=True)
+            deleted.append(str(d))
+    return deleted
 
 
 # --------------------------------------------------------------------------- #
@@ -364,6 +398,14 @@ def train(
         ddp_find_unused_parameters=False,
     )
     trainer = Trainer(model=model, args=args, train_dataset=train_ds, data_collator=default_data_collator)
+
+    # Self-heal checkpoint drift before resuming: a preemptible Volume can resurrect rotation
+    # deletes that weren't committed before a kill, leaving more than save_total_limit dirs. Main
+    # rank only (other ranks would race the same rmtree); the newest valid dir is always retained.
+    if not fresh and _is_main():
+        pruned = _prune_checkpoints(ckpt_dir, keep=3)
+        if pruned:
+            _log_main(f"[train] pruned {len(pruned)} stale checkpoint(s): {[Path(p).name for p in pruned]}")
 
     # Resume from the newest *complete* checkpoint (falls back to the previous if the newest was
     # truncated by a mid-save kill); --fresh ignores them and trains from scratch.
